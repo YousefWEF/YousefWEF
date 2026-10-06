@@ -506,16 +506,36 @@ matrix also reports `water_value_usd`, `hydropower_gwh` and
 ### 6.7 Negotiation
 
 `negotiate(basin, flow_factor=1.0, rule="talmud", claims=None, batna=None,
-estate=None, tol=1e-6)` (Fisher & Ury 1981; Ansink & Weikard 2012; Mianabadi
-et al. 2014):
+estate=None, tol=1e-6, claim_basis="demand", include_storage=False)` (Fisher &
+Ury 1981; Ansink & Weikard 2012; Mianabadi et al. 2014) divides the water on a
+*consumptive* basis - the net-use accounting of river sharing problems, the
+same convention as `NexusModel.entitlements` (section 8) - and hands the
+awards back as gross withdrawal caps:
 
 ```text
-1. claims_r   = treaty_allocation_mm3 (or total withdrawal demand when None); `claims` overrides entries
+1. claims_r   = river_demand_r = (sum_s demand_r[s] - groundwater_r - desalination_r)+   (claim_basis="demand", default)
+              = treaty_allocation_mm3_r, or river_demand_r when None                    (claim_basis="treaty")
+              `claims` overrides entries (gross withdrawals)
+   ratio_r    = sum_s f_r[s] demand_r[s] / sum_s demand_r[s]        (consumption_ratio; 1 when the demand is 0)
+   cclaim_r   = claims_r * ratio_r                                   (consumptive claim)
 2. estate     = (natural_flow * flow_factor - environmental_flow_terminal)+   (bankruptcy_estate; or `estate` if given)
-3. proposal   = apply_rule(rule, estate, claims)
-4. batna_r    = surface withdrawal of r in route_basin(basin, flow_factor, entitlements={all None})   (unilateral upstream priority); `batna` overrides
+3. caward     = apply_rule(rule, estate, cclaim)                     (consumptive awards, sum = min(estate, sum cclaim))
+   proposal_r = clip(caward_r / ratio_r, 0, claims_r)                (gross withdrawal cap; = claims_r when caward_r = cclaim_r)
+4. batna_r    = surface withdrawal of r in route_basin(basin, flow_factor, entitlements={all None},
+                                                      storages={all 0}, reservoir_refill_fraction=0)
+              (unilateral upstream priority from this year's flow; `include_storage=True` keeps the
+              riparians' reservoir storage and the default refill; `batna` overrides)
 5. acceptable_r = proposal_r >= batna_r - tol;   zopa = all acceptable
 ```
+
+`river_demand_mm3(riparian)` is the withdrawal demand net of the non-river
+supply, exactly the sum of the `river_demand` that `route_basin` serves (the
+pro-rata offset leaves the total unchanged); `consumption_ratio(riparian)` is
+the demand-weighted consumption fraction, invariant to that offset, so
+`consumptive = gross * ratio` holds for the demand and for the river demand
+alike. Claims are demands by default because a claim is what a party asks
+for; a treaty entitlement is itself a negotiated outcome and is available as
+`claim_basis="treaty"` to renegotiate from the existing settlement.
 
 `bankruptcy_estate(basin, flow_factor=1.0)` defines the estate as the largest
 total consumption compatible with every in-stream requirement. With `Q_r` the
@@ -533,19 +553,44 @@ instead of 1 500 Mm3/yr withheld at mean flow. The function also returns
 allowed above each outlet) and `infeasible_reaches` (reaches whose requirement
 exceeds the natural flow at their own outlet).
 
-The proposal is also routed as entitlements to report `routed_withdrawals`,
-`outflow_to_sea_mm3` and `env_flow_met_share`; `gini` (of awards),
-`gini_satisfaction` and `satisfaction` are returned too. Because the estate
-is a consumptive volume that ignores storage and return flows, physically
-routed BATNAs can exceed every award (no ZOPA) - pass `estate=` to negotiate
-over another pie.
+The proposal is also routed as entitlements (same storage setting) to report
+`routed_withdrawals`, `routed_consumption`, `outflow_to_sea_mm3` and
+`env_flow_met_share`; `gini` (of the gross proposal), `gini_satisfaction` and
+`satisfaction` (`proposal / claim = caward / cclaim`) are returned too, with
+`claim_basis`, `include_storage`, `consumption_ratio`, `consumptive_claims`,
+`consumptive_awards`, `total_consumptive_award_mm3` (`= min(estate, sum
+cclaim)`) and `total_awarded_mm3` (sum of the gross caps). The cap is pro rata while the
+router fills the sectors in `SECTOR_PRIORITY` order (municipal, industrial,
+energy, agricultural), so a capped riparian consumes `sum_s f_s w_s` over the
+sectors filled before the cap binds: at most its consumptive award whenever no
+prefix of that order has a demand-weighted fraction above the riparian's ratio
+- with the default fractions every sector ahead of agriculture (0.20 / 0.10 /
+0.03) lies below the example ratios 0.37 / 0.45 / 0.47, so the bound holds
+there - but a high-fraction sector served first (e.g. municipal with `f =
+0.95`) lets a riparian consume more than its award. The total routed
+consumption stays within the estate whenever the terminal requirement is met
+and storage is excluded (`natural_flow = consumption + outflow_to_sea` with
+`outflow_to_sea >= env_terminal`), whatever the caps; `NexusModel` (section 8)
+inverts each award sector by sector in priority order instead and has the
+per-riparian guarantee by construction. On the example basin the consumptive
+claims (11 468 Mm3/yr) fit into the estate down to a flow factor of about
+0.46: at 1.0 and 0.6 every riparian is capped at its river demand and a ZOPA
+exists; at 0.4 (estate 9 700) the Talmud rule rations, the upstream riparians
+- whose BATNA is their full river demand - reject, and Delta, which can only
+withdraw the 7 328 Mm3 that still reach it unilaterally, accepts.
+
+### 6.8 Rule comparison
 
 `compare_allocation_rules(basin, flow_factor=1.0, rules=None, claims=None,
-estate=None)` builds the same claims problem, applies every rule and routes
-each award vector, returning per rule: `estate`, `claims`, `awards`,
+estate=None, claim_basis="demand", include_storage=False)` builds the same
+claims problem, applies every rule to the consumptive claims, converts each
+award vector into gross caps and routes it, returning per rule: `estate`,
+`claims` (gross), `consumption_ratio`, `consumptive_claims`,
+`consumptive_awards`, `total_consumptive_award_mm3`, `awards` (gross caps),
 `total_awarded_mm3`, `gini`, `gini_satisfaction`, `satisfaction`,
-`min_satisfaction`, `withdrawals`, `total_withdrawal_mm3`, `supply_ratio`,
-`outflow_to_sea_mm3`, `env_flow_met_share`.
+`min_satisfaction`, `withdrawals`, `total_withdrawal_mm3`, `consumption`,
+`total_consumption_mm3`, `supply_ratio`, `outflow_to_sea_mm3`,
+`env_flow_met_share`.
 
 ---
 
@@ -653,7 +698,7 @@ which is `"upstream_priority"` whenever `scenario.cooperation` is False):
 |------|------|
 | `"upstream_priority"` / `None` | none (upstream withdraws first) |
 | `"treaty"` | `{r: r.treaty_allocation_mm3}` (None = no cap); fixed volumes, not scaled with flow |
-| bankruptcy rule (`proportional`, `cea`, `cel`, `talmud`, `ap`, `equal`) | consumptive-use accounting (`NexusModel.claims`, `NexusModel.entitlements`): `estate = (natural_flow + sum_r storage_start_r - sum_r environmental_r)+`, `claims_r = sum_s river_demand_r[s] * consumption_fraction_r[s]` (gross demand net of the riparian's non-river supply, pro rata as in `route_basin`), `awards = apply_rule(rule, estate, claims)`; the cap of `r` is the gross surface withdrawal at which its consumption, serving sectors in priority order, equals its award (never binding when award = claim, so a rule only rations under physical scarcity). This convention differs from `diplomacy.bankruptcy_estate` (section 6.7), which withholds only the terminal requirement and counts no storage |
+| bankruptcy rule (`proportional`, `cea`, `cel`, `talmud`, `ap`, `equal`) | consumptive-use accounting (`NexusModel.claims`, `NexusModel.entitlements`): `estate = (natural_flow + sum_r storage_start_r - sum_r environmental_r)+`, `claims_r = sum_s river_demand_r[s] * consumption_fraction_r[s]` (gross demand net of the riparian's non-river supply, pro rata as in `route_basin`), `awards = apply_rule(rule, estate, claims)`; the cap of `r` is the gross surface withdrawal at which its consumption, serving sectors in priority order, equals its award (never binding when award = claim, so a rule only rations under physical scarcity). `diplomacy.negotiate` (section 6.7) uses the same consumptive claims (it converts an award back into a cap pro rata, `award / consumption_ratio`, where this method serves the sectors in priority order); the remaining difference is the estate: `NexusModel` adds the carried storage and subtracts every reach's environmental flow (a cautious operating rule for a multi-year run), whereas `diplomacy.bankruptcy_estate` withholds only the terminal reserve and counts no storage (the water a single year's flow can divide) |
 
 **Step 3 - water**: `route_basin(basin, flow_factor, entitlements=caps,
 demands=demands, storages=previous year's storages_end(),

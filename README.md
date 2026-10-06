@@ -84,8 +84,10 @@ any real river.
   institutional weakness, conflict history, variability, environmental
   shortfall, upstream dam filling).
 - Sadoff & Grey benefit typology (to / from / because of / beyond the river).
-- Negotiation framing: claims problem, rule-based proposal, unilateral BATNA,
-  zone of possible agreement (ZOPA).
+- Negotiation framing: consumptive claims problem (river demands or treaty
+  entitlements times the consumption ratio), rule-based proposal handed back
+  as gross withdrawal caps, unilateral BATNA, zone of possible agreement
+  (ZOPA).
 
 **Sustainability and scenarios**
 - Water, energy and food security indices and an overall WEF nexus index
@@ -180,33 +182,48 @@ year, `result.to_csv(path)` / `result.to_dataframe()` export everything.
 ```python
 from wefnexus import diplomacy as D
 
-neg = D.negotiate(basin, flow_factor=0.6, rule="talmud")   # a 40 % drought year
+neg = D.negotiate(basin, flow_factor=0.4, rule="talmud")   # a 60 % drought year
 for name in basin.names():
-    print(f"{name:9s} claim {neg['claims'][name]:6.0f}  award {neg['proposal'][name]:6.0f}  "
+    print(f"{name:9s} claim {neg['claims'][name]:6.0f} (consumptive {neg['consumptive_claims'][name]:5.0f})  "
+          f"award {neg['consumptive_awards'][name]:5.0f} -> cap {neg['proposal'][name]:6.0f}  "
           f"BATNA {neg['batna'][name]:6.0f}  accepts {neg['acceptable'][name]}")
 print("estate", round(neg["estate"]), "Mm3/yr | ZOPA:", neg["zopa"], "| Gini:", round(neg["gini"], 3))
+print("flow factor 0.6: ZOPA", D.negotiate(basin, flow_factor=0.6)["zopa"], "| 1.0: ZOPA", D.negotiate(basin)["zopa"])
 ```
 
 Output:
 
 ```text
-Highland  claim   2500  award   1250  BATNA   1500  accepts False
-Midland   claim   9000  award   4500  BATNA   7350  accepts False
-Delta     claim  16000  award   9550  BATNA  15316  accepts False
-estate 15300 Mm3/yr | ZOPA: False | Gini: 0.362
+Highland  claim   1500 (consumptive   550)  award   275 -> cap    750  BATNA   1500  accepts False
+Midland   claim   7350 (consumptive  3322)  award  2576 -> cap   5698  BATNA   7350  accepts False
+Delta     claim  16300 (consumptive  7596)  award  6850 -> cap  14698  BATNA   7328  accepts True
+estate 9700 Mm3/yr | ZOPA: False | Gini: 0.44
+flow factor 0.6: ZOPA True | 1.0: ZOPA True
 ```
 
-The claims are the treaty entitlements, the estate is the natural flow of the
-year minus the environmental flow that must still reach the sea at the basin
-outlet (16 800 - 1 500 Mm3; an upstream in-stream requirement is not a
-withdrawal and the water it keeps in the river stays available to the
-riparians below, see `D.bankruptcy_estate`), the proposal is the Talmud
-division of that estate, and the BATNA is what each riparian would withdraw
-unilaterally (upstream priority, no caps). Here no zone of possible agreement
-exists: the estate is a consumptive volume that ignores return flows and
-reservoir storage, both of which the physical routing re-uses, so every
-riparian does better by not agreeing. Pass `estate=` to negotiate over a
-different pie, or compare rules with `D.compare_allocation_rules(basin, 0.6)`.
+The claims are the riparians' river demands (withdrawal demand net of
+groundwater and desalination: 1 500 / 7 350 / 16 300 Mm3/yr; pass
+`claim_basis="treaty"` to start from the treaty entitlements instead), the
+estate is the natural flow of the year minus the environmental flow that must
+still reach the sea at the basin outlet (11 200 - 1 500 Mm3; an upstream
+in-stream requirement is not a withdrawal and the water it keeps in the river
+stays available to the riparians below, see `D.bankruptcy_estate`). Because
+return flows are re-used downstream the division is made on a consumptive
+basis: each claim is multiplied by the riparian's demand-weighted consumption
+fraction (`D.consumption_ratio`: 0.37 / 0.45 / 0.47), the Talmud rule divides
+the estate among those consumptive claims (11 468 Mm3/yr in total) and each
+award is converted back into a gross withdrawal cap (`award / ratio`). The
+BATNA is what each riparian would withdraw unilaterally from the same year's
+flow (upstream priority, no caps, no reservoir draw-down;
+`include_storage=True` lets it draw on storage). In a normal year and at a
+flow factor of 0.6 the estate covers every consumptive claim, every riparian
+is capped at its own demand and a zone of possible agreement exists; at 0.4
+the rule rations, and the upstream riparians - whose BATNA is their full
+demand - reject the proposal while Delta, which can only withdraw the 7 328
+Mm3 that still reach it when everybody acts unilaterally, accepts. Pass
+`estate=` to negotiate over a different pie, or compare rules with
+`D.compare_allocation_rules(basin, 0.4)` (CEA, which protects the small
+upstream claimants in full, does find a ZOPA in that year).
 
 ### 3. Conflict risk of a drought year
 
@@ -271,7 +288,7 @@ fig = viz.plot_supply_ratio(result, save="supply_ratio.png")
 fig = viz.plot_nexus_indices(result)
 fig = viz.plot_water_balance(result, "Delta", basin=basin)
 fig = viz.plot_nexus_radar(result.summary())
-fig = viz.plot_allocation_rules(D.compare_allocation_rules(basin, 0.6))
+fig = viz.plot_allocation_rules(D.compare_allocation_rules(basin, 0.4))   # the rationing year
 fig = viz.plot_pareto(O.pareto_front(basin, 0.6, points=5))
 fig = viz.plot_nexus_graph(basin, balance=drought)       # networkx DiGraph of river, sectors and sources
 ```
@@ -290,7 +307,7 @@ python -m wefnexus <command> [options]      # or:  wefnexus <command> [options]
 | Command        | What it does                                                                                            |
 |----------------|---------------------------------------------------------------------------------------------------------|
 | `run`          | simulate one scenario and print the per-riparian summary table (`--csv`, `--json` write full results)   |
-| `allocate`     | divide an estate among claims with a bankruptcy rule (explicit `--claims` or a basin's entitlements)    |
+| `allocate`     | divide an estate among claims with a bankruptcy rule (explicit `--claims` or a basin's river demands / entitlements on a consumptive basis) |
 | `negotiate`    | claims-problem proposal versus each riparian's BATNA; is there a ZOPA?                                  |
 | `compare`      | run several library scenarios and print the comparison table                                            |
 | `pareto`       | benefit-equity Pareto front of the allocation LP                                                        |
@@ -350,29 +367,44 @@ total awarded 200.0 | gini 0.083 | gini (satisfaction) 0.148 | min satisfaction 
 ```
 
 With `--rule all` every rule is tabulated side by side; with `--basin` the
-claims are the riparians' treaty entitlements (or demands), the estate is the
-natural flow times `--flow-factor` minus the in-stream requirement at the
-basin outlet (`--estate` overrides) and each rule's awards are also routed
-through the basin (`outflow_to_sea_mm3`, `env_flow_met_share` columns).
+gross claims are the riparians' river demands (`--claims-basis demand`,
+default) or treaty entitlements (`--claims-basis treaty`), the rules divide
+the consumptive estate - natural flow times `--flow-factor` minus the
+in-stream requirement at the basin outlet (`--estate` overrides) - among the
+consumptive claims (`c-claim` and `c-award` columns for a single rule, a
+`c-total` column with `--rule all`), and each rule's awards are converted
+into gross withdrawal caps and routed through the basin (a
+`routed_withdrawal` column for a single rule, with the outflow to sea and the
+environmental-flow share in the footer line; `outflow_to_sea_mm3` and
+`env_flow_met_share` columns with `--rule all`; `--include-storage` lets the
+routing draw on the reservoirs).
 
 ### `negotiate`
 
 ```bash
-python -m wefnexus negotiate --flow-factor 0.6 --rule talmud
-python -m wefnexus negotiate --rule cea --estate 16800 --json negotiation.json
+python -m wefnexus negotiate --flow-factor 0.4 --rule talmud
+python -m wefnexus negotiate --claims treaty --include-storage --json negotiation.json
 ```
 
 ```text
-Negotiation: Azura River (stylised) | flow factor 0.6 | rule talmud
-natural flow 16,800.0 Mm3 | environmental flows 7,000.0 Mm3 (reserve at the outlet 1,500.0 Mm3) | estate 15,300.0 Mm3 | total claims 27,500.0 Mm3
-riparian  claim  proposal  batna  satisfaction  acceptable  routed
-------------------------------------------------------------------
-Highland   2500      1250   1500         0.500  no            1250
-Midland    9000      4500   7350         0.500  no            4500
-Delta     16000      9550  15316         0.597  no            9550
-total awarded 15,300.0 Mm3 | gini 0.362 | gini (satisfaction) 0.040 | outflow to sea 6,068.9 Mm3 | env flow met share 1.00
-ZOPA: no - proposal below the BATNA of Highland, Midland, Delta
+Negotiation: Azura River (stylised) | flow factor 0.4 | rule talmud | claims demand | storage excluded
+natural flow 11,200.0 Mm3 | environmental flows 7,000.0 Mm3 (reserve at the outlet 1,500.0 Mm3) | estate 9,700.0 Mm3 | total claims 25,150.0 Mm3 (consumptive 11,468.1 Mm3)
+riparian  claim  c-claim  c-award  proposal  batna  satisfaction  acceptable  routed
+------------------------------------------------------------------------------------
+Highland   1500      550      275       750   1500         0.500  no             750
+Midland    7350     3322     2576      5698   7350         0.775  no            5698
+Delta     16300     7596     6850     14698   7328         0.902  yes           8744
+total awarded 21,146.2 Mm3 (consumptive 9,700.0 Mm3) | gini 0.440 | gini (satisfaction) 0.123 | outflow to sea 5,681.5 Mm3 | env flow met share 1.00
+ZOPA: no - proposal below the BATNA of Highland, Midland
 ```
+
+`--claims demand` (default) takes the river demands as gross claims,
+`--claims treaty` the treaty entitlements; `--include-storage` lets the
+unilateral BATNA and the routed proposal draw on the reservoirs. At flow
+factors 1.0 and 0.6 the first command reports `ZOPA: yes` (no rationing);
+the second one reports `ZOPA: no - proposal below the BATNA of Delta` even at
+mean flow, because Delta's 16 000 Mm3 treaty entitlement is below the 16 300
+Mm3 it withdraws unilaterally.
 
 ### `compare`
 
@@ -457,7 +489,7 @@ python -m wefnexus export-basin --basin my_basin.json --out normalised.json
 | `wefnexus.energy`       | leaf        | `hydropower_gwh`, `pumping_energy_gwh`, `desalination_energy_gwh`, `treatment_energy_gwh`, `thermal_generation_gwh`, `thermal_cooling_water_mm3`, `energy_for_water`, `water_for_energy`, `energy_balance`, `energy_security_index` |
 | `wefnexus.food`         | leaf        | `crop_evapotranspiration_mm`, `net_irrigation_mm`, `gross_irrigation_mm`, `irrigation_requirement_mm3`, `riparian_irrigation_requirement_mm3`, `fao33_yield`, `crop_production`, `riparian_food_production`, `food_self_sufficiency`, `food_security_index`, `virtual_water_content_m3_per_t`, `virtual_water_import_mm3`, `energy_for_agriculture_gwh` |
 | `wefnexus.allocation`   | leaf        | `proportional`, `constrained_equal_awards`, `constrained_equal_losses`, `talmud`, `adjusted_proportional`, `equal_split`, `upstream_priority`, `apply_rule`, `compare_rules`, `RULES`; `shapley_value`, `nucleolus`, `is_in_core`, `core_constraints_violations`, `bankruptcy_game`, `nash_bargaining`; `gini`, `satisfaction`, `envy_free` |
-| `wefnexus.diplomacy`    | composite   | `Treaty`, `BarEvent`, `BAR_SCALE`, `hydro_hegemony`, `power_asymmetry`, `cooperation_index`, `conflict_intensity`, `twins_classification`, `treaty_from_basin`, `treaty_resilience`, `treaty_compliance`, `water_dependency`, `conflict_risk_index`, `benefit_sharing_matrix`, `negotiate`, `compare_allocation_rules` |
+| `wefnexus.diplomacy`    | composite   | `Treaty`, `BarEvent`, `BAR_SCALE`, `hydro_hegemony`, `power_asymmetry`, `cooperation_index`, `conflict_intensity`, `twins_classification`, `treaty_from_basin`, `treaty_resilience`, `treaty_compliance`, `water_dependency`, `conflict_risk_index`, `benefit_sharing_matrix`, `bankruptcy_estate`, `consumption_ratio`, `river_demand_mm3`, `negotiate`, `compare_allocation_rules` |
 | `wefnexus.sustainability` | composite | `normalise`, `weighted_geometric_mean`, `water_security_index`, `energy_security_index`, `food_security_index`, `wef_nexus_index`, `equity_index`, `sdg_indicators`, `SustainabilityReport`, `assess` |
 | `wefnexus.nexus`        | composite   | `NexusModel`, `run_nexus`, `NexusResult`, `RiparianYear` - the integrated multi-year simulation                                                                          |
 | `wefnexus.optimize`     | composite   | `optimize_allocation` -> `OptimizationResult`, `pareto_front`, `route_allocation` (SciPy `linprog`, HiGHS)                                                              |
@@ -499,8 +531,10 @@ downstream) the hegemony scores are 0.61, 0.60 and 0.50, a power asymmetry of
 flow, treaty entitlements sum to 27,500 Mm3/yr and environmental flows to
 7,000 Mm3/yr, so the basin is comfortable in a normal year and stressed in a
 drought: a normal year routes 9,534 Mm3 to the sea with a Delta supply ratio of
-0.984; at a flow factor of 0.6 every rule-based division leaves at least one
-riparian below its unilateral BATNA.
+0.984; the consumptive river-water claims (11,468 Mm3/yr) fit into the
+negotiation estate down to a flow factor of about 0.46, so at 0.6 every
+sharing rule still honours every claim, while at 0.4 the rules ration and the
+upstream riparians fall below their unilateral BATNA.
 
 Default sector consumption fractions are 0.20 municipal, 0.10 industrial,
 0.03 energy, 0.60 agricultural; default water values are 1.50 / 0.80 / 0.40 /
@@ -651,13 +685,27 @@ supply ratio (Haimes et al. 1971).
   transparent constants (`CONFLICT_RISK_WEIGHTS`, `TREATY_RESILIENCE_WEIGHTS`,
   ...) meant to be re-weighted for a real study.
 - **Negotiation estate** is natural flow minus the in-stream requirement at the
-  basin outlet (`diplomacy.bankruptcy_estate`): a consumptive volume that
-  ignores storage and return flows, so BATNAs from the physical routing can
-  exceed any rule-based award (no ZOPA). This is a feature for teaching the gap
-  between "water on paper" and "water in the river", and `estate=` lets you
-  negotiate a different pie. The bankruptcy rules inside `NexusModel` use a
-  different convention (natural flow plus carried storage minus the sum of all
-  environmental flows, with consumptive claims; see `docs/METHODOLOGY.md`).
+  basin outlet (`diplomacy.bankruptcy_estate`), a consumptive volume divided
+  among consumptive claims (river demand x consumption ratio) and handed back
+  as gross withdrawal caps; the BATNA is the unilateral withdrawal from the
+  same year's flow. Reservoir storage is left out of the pie by default
+  (`include_storage=True` lets the BATNA and the routing draw on it). Return
+  flows enter through one demand-weighted consumption ratio per riparian
+  whereas the physical routing serves sectors in priority order (municipal,
+  industrial, energy, agricultural), so a capped riparian may consume less
+  than its award - and never more only when, as with the default fractions,
+  every sector served before agriculture has a fraction below the riparian's
+  ratio; a high-fraction sector served first lets a riparian consume more
+  than its award, and the total routed consumption stays within the estate
+  only while the requirement at the outlet is met. With demand claims a ZOPA
+  can therefore only fail under physical scarcity; with treaty (or explicit)
+  claims a riparian whose claim lies below its river demand - Delta on the
+  example basin, 16 000 against a 16 300 Mm3 unilateral withdrawal - rejects
+  even in a normal year. `estate=` lets you negotiate a different pie. The
+  bankruptcy rules inside `NexusModel` use the same consumptive claims but
+  add the carried storage to the estate, subtract every reach's
+  environmental flow and invert each award sector by sector in priority
+  order (see `docs/METHODOLOGY.md`).
 - **LP optimisation** ignores reservoirs (annual steady state) and groundwater
   dynamics, and assumes linear benefits (constant USD/m3 per sector).
 - **Stochastic flows** are independent lognormal multipliers with a given CV

@@ -646,15 +646,30 @@ def _check_comparison(comparison: Any) -> Tuple[List[str], List[str], Dict[str, 
         else:
             raise ValueError(f"comparison[{rule!r}] needs a 'satisfaction' or 'claims' mapping")
         gini = row.get("gini")
+        c_awards = row.get("consumptive_awards")
+        consumptive = isinstance(c_awards, Mapping) and all(n in c_awards for n in names)
         rows[rule] = {
             "awards": awards,
+            "consumptive_awards": None if not consumptive else {
+                n: _float(c_awards[n], f"consumptive_awards[{n}]") for n in names
+            },
             "satisfaction": satisfaction,
             "gini": None if gini is None else _float(gini, "gini"),
             "estate": None if row.get("estate") is None else _float(row["estate"], "estate"),
             "claims": None if not isinstance(row.get("claims"), Mapping) else {
                 n: _float(row["claims"].get(n, 0.0), f"claims[{n}]") for n in names
             },
+            "consumptive_claims": None if not isinstance(row.get("consumptive_claims"), Mapping) else {
+                n: _float(row["consumptive_claims"].get(n, 0.0), f"consumptive_claims[{n}]") for n in names
+            },
         }
+    # the bars and the claims line share one basis: the consumptive awards (what the rules divide, the basis
+    # of the estate) when every rule carries them, the gross awards (legacy / explicit input) otherwise
+    consumptive = all(rows[r]["consumptive_awards"] is not None for r in rules)
+    for r in rules:
+        rows[r]["bars"] = rows[r]["consumptive_awards"] if consumptive else rows[r]["awards"]
+        rows[r]["claims_line"] = rows[r]["consumptive_claims"] if consumptive else rows[r]["claims"]
+        rows[r]["consumptive"] = consumptive
     return rules, names, rows
 
 
@@ -667,20 +682,28 @@ def plot_allocation_rules(
     """Compare sharing rules: awards per riparian and satisfaction per rule.
 
     Left panel: horizontal stacked bars of the awards (Mm3/yr) of every
-    riparian under each rule, with the estate (water available) and the
-    total claims as grey reference lines - the bankruptcy-problem view of a
-    basin (Mianabadi et al. 2014; Thomson 2003).  Right panel: a dot plot of
-    each riparian's satisfaction ``award / claim`` per rule, with the Gini
-    coefficient of the awards printed beside each row and a line at full
-    satisfaction.  Riparians keep their fixed colours in both panels.
+    riparian under each rule, with the estate and the total claims as grey
+    reference lines - the bankruptcy-problem view of a basin (Mianabadi et
+    al. 2014; Thomson 2003).  The three are drawn on one basis: when every
+    rule carries ``"consumptive_awards"`` (the rows of
+    :func:`wefnexus.diplomacy.compare_allocation_rules`, whose estate is
+    the consumptive water the year can divide) the bars are the consumptive
+    awards and the claims line the consumptive claims, so the bars sum to
+    ``min(estate, total claims)``; otherwise the gross ``"awards"`` and
+    ``"claims"`` are drawn (legacy or explicit input).  Right panel: a dot
+    plot of each riparian's satisfaction ``award / claim`` per rule (the
+    same on either basis), with the Gini coefficient of the awards printed
+    beside each row and a line at full satisfaction.  Riparians keep their
+    fixed colours in both panels.
 
     Parameters
     ----------
     comparison : dict
         Output of :func:`wefnexus.diplomacy.compare_allocation_rules`:
         ``{rule: {"awards": {...}, "satisfaction": {...}, "gini": ...,
-        "estate": ..., "claims": {...}}}``; ``"satisfaction"`` is derived
-        from ``"claims"`` when missing, the other extras are optional.
+        "estate": ..., "claims": {...}, "consumptive_awards": {...},
+        "consumptive_claims": {...}}}``; ``"satisfaction"`` is derived from
+        ``"claims"`` when missing, the other extras are optional.
     save : str or path-like, optional
         Also write the figure to this path.
     title : str, optional
@@ -708,15 +731,16 @@ def plot_allocation_rules(
             a.grid(True, axis="x")
             a.grid(False, axis="y")
         ypos = list(range(n_rules))[::-1]
+        consumptive = rows[rules[0]]["consumptive"]
         left = [0.0] * n_rules
         for i, name in enumerate(names):
-            vals = [max(rows[r]["awards"][name], 0.0) for r in rules]
+            vals = [max(rows[r]["bars"][name], 0.0) for r in rules]
             ax.barh(ypos, vals, left=left, height=0.62, color=riparian_color(i), edgecolor=SURFACE, linewidth=1.0,
                     label=name, zorder=3)
             left = [l + v for l, v in zip(left, vals)]
         x_max = max(left) if left else 0.0
         estates = [rows[r]["estate"] for r in rules if rows[r]["estate"] is not None]
-        claims_rows = [rows[r]["claims"] for r in rules if rows[r]["claims"] is not None]
+        claims_rows = [rows[r]["claims_line"] for r in rules if rows[r]["claims_line"] is not None]
         total_claims = sum(claims_rows[0].values()) if claims_rows else None
         for ref in (estates[0] if estates else None, total_claims):
             if ref is not None:
@@ -728,13 +752,14 @@ def plot_allocation_rules(
                         fontsize=8.5, color=INK_SECONDARY, va="center", ha="right")
         if total_claims is not None:
             ax.axvline(total_claims, color=MUTED, linewidth=1.2, linestyle=":", zorder=4)
-            ax.annotate("total claims", xy=(total_claims, ypos[-1] - 0.5), xytext=(-4, 0),
+            ax.annotate("consumptive claims" if consumptive else "total claims",
+                        xy=(total_claims, ypos[-1] - 0.5), xytext=(-4, 0),
                         textcoords="offset points", fontsize=8.5, color=INK_SECONDARY, va="center", ha="right")
         ax.set_yticks(ypos)
         ax.set_yticklabels(rules)
-        ax.set_xlabel("Award (Mm3/yr)")
+        ax.set_xlabel("Consumptive award (Mm3/yr)" if consumptive else "Award (Mm3/yr)")
         ax.set_xlim(0.0, x_max)
-        ax.set_title("Awards by riparian")
+        ax.set_title("Consumptive awards by riparian" if consumptive else "Awards by riparian")
         ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.18), ncol=min(len(names), 4))
 
         jitter = 0.5 / max(len(names), 1)

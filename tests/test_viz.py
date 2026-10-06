@@ -286,10 +286,14 @@ def test_plot_allocation_rules(comparison, mpl, tmp_path):
     assert [t.get_text() for t in ax.get_yticklabels()] == rules
     names = list(next(iter(comparison.values()))["awards"])
     assert len(ax.containers) == len(names)
-    # every stacked bar sums to the rule's total award
+    # the rows of compare_allocation_rules carry consumptive awards: the bars, the estate line and the claims
+    # line are drawn on that one basis, so every stacked bar sums to the rule's total consumptive award
+    assert ax.get_xlabel() == "Consumptive award (Mm3/yr)"
     for k, rule in enumerate(rules):
         total = sum(container[k].get_width() for container in ax.containers)
-        assert total == pytest.approx(comparison[rule]["total_awarded_mm3"])
+        assert total == pytest.approx(comparison[rule]["total_consumptive_award_mm3"])
+        assert total <= comparison[rule]["estate"] + 1e-6
+        assert total < comparison[rule]["total_awarded_mm3"]  # the gross caps exceed the consumptive awards
     assert ax.get_legend() is not None
     assert [t.get_text() for t in ax.get_legend().get_texts()] == names
     assert len(ax2.lines) >= len(names)
@@ -303,6 +307,9 @@ def test_plot_allocation_rules_minimal_and_errors(mpl):
     }
     fig = V.plot_allocation_rules(minimal, title="t")
     assert fig._suptitle.get_text() == "t"
+    ax = fig.axes[0]
+    assert ax.get_xlabel() == "Award (Mm3/yr)"  # no consumptive awards: the gross awards are drawn
+    assert sum(container[0].get_width() for container in ax.containers) == pytest.approx(6.0)
     with pytest.raises(ValueError):
         V.plot_allocation_rules({})
     with pytest.raises(ValueError):

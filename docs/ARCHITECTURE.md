@@ -365,16 +365,26 @@ def benefit_sharing_matrix(basin, balance, cooperative_balance=None) -> Dict[str
     # "to_the_river" (environmental flow compliance), "from_the_river" (economic value of water + hydropower),
     # "because_of_the_river" (reduced conflict risk ∝ 1 - conflict_risk), "beyond_the_river" (trade/integration proxy: cooperative gain)
 
-def negotiate(basin, flow_factor=1.0, rule="talmud", claims=None, batna=None) -> Dict[str, Any]
-    # 1) claims = treaty allocation or total withdrawal demand per riparian
-    # 2) estate = basin natural flow * flow_factor minus sum of environmental flows (what can be consumed/withdrawn)
-    # 3) proposal = allocation.apply_rule(rule, estate, claims)
-    # 4) batna = unilateral outcome: route_basin with upstream_priority (no entitlements)
-    # 5) zopa: proposal acceptable to each riparian if proposal >= batna withdrawal (within tol)
-    # returns {"estate","claims","proposal","batna","acceptable": {name: bool}, "zopa": bool, "gini", "satisfaction"}
+def consumption_ratio(riparian) -> float      # sum_s f_s d_s / sum_s d_s over the withdrawal sectors (1.0 if no demand)
+def river_demand_mm3(riparian) -> float       # max(total withdrawal demand - groundwater - desalination, 0), as route_basin serves it
 
-def compare_allocation_rules(basin, flow_factor=1.0, rules=None) -> Dict[str, Dict[str, Any]]
-    # for each rule: awards, gini, min satisfaction, basin outflow after routing with those entitlements
+def negotiate(basin, flow_factor=1.0, rule="talmud", claims=None, batna=None, *, estate=None, tol=1e-6,
+              claim_basis="demand", include_storage=False) -> Dict[str, Any]
+    # 1) claims (gross withdrawals) = river_demand_mm3 per riparian (claim_basis "demand", default) or the treaty
+    #    allocation (claim_basis "treaty", river demand when None); `claims` overrides entries;
+    #    consumptive_claims = claims * consumption_ratio
+    # 2) estate = max(basin natural flow * flow_factor - terminal environmental flow, 0) (bankruptcy_estate; what can be consumed)
+    # 3) consumptive_awards = allocation.apply_rule(rule, estate, consumptive_claims);
+    #    proposal = consumptive_award / ratio clipped to [0, claim] (gross withdrawal caps)
+    # 4) batna = unilateral outcome: route_basin with no entitlements, empty reservoirs and no refill
+    #    (this year's flow only; include_storage=True keeps the riparians' storages)
+    # 5) zopa: proposal acceptable to each riparian if proposal >= batna withdrawal (within tol)
+    # returns {"estate","claims","consumption_ratio","consumptive_claims","consumptive_awards","proposal","batna",
+    #          "acceptable": {name: bool}, "zopa": bool, "gini", "satisfaction", "routed_withdrawals", "routed_consumption", ...}
+
+def compare_allocation_rules(basin, flow_factor=1.0, rules=None, *, claims=None, estate=None,
+                             claim_basis="demand", include_storage=False) -> Dict[str, Dict[str, Any]]
+    # for each rule: consumptive awards, gross awards (caps), gini, min satisfaction, basin outflow after routing with those caps
 ```
 
 ---
@@ -532,7 +542,28 @@ during review; the code, its tests (`tests/test_diplomacy.py`,
   terminal outlet is withheld, not the sum of every reach's requirement,
   because water left at an upstream outlet is not a withdrawal and remains
   available to the riparians below (example basin at mean flow: 26 500
-  instead of 21 000 Mm3/yr).
+  instead of 21 000 Mm3/yr).  That estate is consumptive, so the claims are
+  consumptive too: the gross claims are the riparians' river demands by
+  default (`claim_basis="demand"`; the treaty entitlements with
+  `claim_basis="treaty"`), each multiplied by its demand-weighted
+  consumption fraction (`diplomacy.consumption_ratio`), the rule divides the
+  estate among those consumptive claims and every award is converted back
+  into a gross withdrawal cap (`award / ratio`, clipped to the claim) before
+  it is routed or compared with the BATNA.  The BATNA is the unilateral
+  withdrawal from the same pie - this year's flow with empty reservoirs and
+  no refill (`include_storage=True` keeps the storages).  With demand claims
+  a year whose consumptive claims fit into the estate therefore honours every
+  claim and reports a ZOPA (example basin: flow factors 1.0 and 0.6), because
+  a riparian never withdraws more than its river demand unilaterally; under
+  the treaty basis a riparian whose entitlement is below its river demand can
+  reject without scarcity (Delta: 16 000 against 16 300 Mm3/yr at mean flow).
+  A rule only rations under physical scarcity (flow factor 0.4: estate 9 700
+  against 11 468 Mm3/yr of consumptive claims), when the upstream riparians
+  reject.  The cap is pro rata (`award / ratio`) whereas `route_basin` fills
+  the sectors in priority order, so the routed consumption of a capped
+  riparian stays within its award only when no sector served ahead of the
+  last one has a fraction above its ratio (true with the default fractions);
+  `NexusModel.entitlements` inverts each award in priority order instead.
 * **`NexusModel.entitlements` (section 7)** – bankruptcy rules work on a
   consumptive basis: `estate = max(natural_flow + sum(start-of-year storages)
   - sum(environmental flows), 0)`, the claims are the consumptive parts of the

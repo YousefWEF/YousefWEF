@@ -12,6 +12,7 @@ from wefnexus.models import Basin, EnergySystem, Riparian, Sector, WaterDemand
 from wefnexus.water import natural_flows, route_basin, sdg_642_water_stress
 from wefnexus.diplomacy import (
     BAR_SCALE,
+    CLAIM_BASES,
     CONFLICT_RISK_CATEGORIES,
     CONFLICT_RISK_WEIGHTS,
     HEGEMONY_PILLARS,
@@ -30,12 +31,14 @@ from wefnexus.diplomacy import (
     compliance_summary,
     conflict_intensity,
     conflict_risk_index,
+    consumption_ratio,
     cooperation_index,
     cooperation_intensity,
     hydro_hegemony,
     negotiate,
     power_asymmetry,
     risk_category,
+    river_demand_mm3,
     treaty_compliance,
     treaty_from_basin,
     treaty_resilience,
@@ -47,6 +50,14 @@ from wefnexus.diplomacy import (
 
 NAMES = ["Highland", "Midland", "Delta"]
 ALLOC = {"Highland": 2_500.0, "Midland": 9_000.0, "Delta": 16_000.0}
+#: River demands (withdrawal demand net of groundwater + desalination): the default gross claims.
+RIVER_DEMAND = {"Highland": 1_500.0, "Midland": 7_350.0, "Delta": 16_300.0}
+#: Demand-weighted consumption fractions (sum f_s d_s / sum d_s with the default fractions
+#: 0.2 / 0.1 / 0.03 / 0.6): Highland 623/1700, Midland 3729/8250, Delta 8668/18600.
+RATIO = {"Highland": 623.0 / 1_700.0, "Midland": 3_729.0 / 8_250.0, "Delta": 8_668.0 / 18_600.0}
+#: Consumptive claims = river demand * ratio: 549.7, 3 322.2, 7 596.2 (11 468.1 in total).
+CONSUMPTIVE = {n: RIVER_DEMAND[n] * RATIO[n] for n in NAMES}
+NO_STORAGE = dict(storages={n: 0.0 for n in NAMES}, reservoir_refill_fraction=0.0)
 ALL_FEATURES = dict(
     variable_allocation=True,
     drought_provisions=True,
@@ -895,9 +906,57 @@ def test_benefit_sharing_edge_cases():
 # ---------------------------------------------------------------------------
 # negotiation
 # ---------------------------------------------------------------------------
+def test_consumption_ratio_and_river_demand(basin):
+    assert {r.name: consumption_ratio(r) for r in basin} == pytest.approx(RATIO)
+    assert {r.name: river_demand_mm3(r) for r in basin} == pytest.approx(RIVER_DEMAND)
+    assert sum(CONSUMPTIVE.values()) == pytest.approx(11_468.06, abs=0.01)
+    # identical to the river demand route_basin serves, whatever the flow
+    for ff in (0.0, 0.4, 1.0):
+        for reach in route_basin(basin, ff).reaches:
+            assert sum(reach.river_demand().values()) == pytest.approx(river_demand_mm3(basin.riparian(reach.name)))
+    # the ratio is the consumptive share of the gross demand (invariant to the pro-rata non-river offset)
+    for r in basin:
+        assert consumption_ratio(r) == pytest.approx(r.demand.consumptive_demand() / r.demand.total_withdrawal())
+        assert 0.0 < consumption_ratio(r) < 1.0
+    # zero demand -> ratio 1, river demand 0
+    zero = make_riparian("Z")
+    assert consumption_ratio(zero) == 1.0 and river_demand_mm3(zero) == 0.0
+    # a missing fraction counts as 0 (fully returned)
+    r = make_riparian("A", mun=100.0, ag=100.0)
+    r.demand.consumption_fraction = {Sector.AGRICULTURAL: 0.5}
+    assert consumption_ratio(r) == pytest.approx(0.25)
+    r.demand.consumption_fraction = {}
+    assert consumption_ratio(r) == 0.0
+    # non-river supply is deducted from the total and floored at 0; it does not change the ratio
+    r.demand.consumption_fraction = {Sector.AGRICULTURAL: 0.5}
+    r.groundwater_abstraction_mm3 = 50.0
+    assert river_demand_mm3(r) == pytest.approx(150.0) and consumption_ratio(r) == pytest.approx(0.25)
+    r.energy.desalination_capacity_mm3 = 500.0
+    assert river_demand_mm3(r) == 0.0
+    # validation
+    r.demand.consumption_fraction = {Sector.AGRICULTURAL: 1.5}
+    with pytest.raises(ValueError):
+        consumption_ratio(r)
+    r.demand.consumption_fraction = {Sector.AGRICULTURAL: 0.5}
+    r.demand.municipal = -1.0
+    with pytest.raises(ValueError):
+        consumption_ratio(r)
+    with pytest.raises(ValueError):
+        river_demand_mm3(r)
+    r.demand.municipal = 100.0
+    r.groundwater_abstraction_mm3 = -1.0
+    with pytest.raises(ValueError):
+        river_demand_mm3(r)
+    with pytest.raises(ValueError):
+        consumption_ratio("Highland")
+    with pytest.raises(ValueError):
+        river_demand_mm3(basin)
+    assert CLAIM_BASES == ("demand", "treaty")
+
+
 def test_negotiate_example_basin(basin):
     out = negotiate(basin)
-    assert out["rule"] == "talmud"
+    assert out["rule"] == "talmud" and out["claim_basis"] == "demand" and out["include_storage"] is False
     # estate = natural flow minus the in-stream flow that must still reach the sea (Delta's 1 500),
     # NOT minus the sum of the three requirements (7 000): upstream in-stream flows are not withdrawals
     assert out["estate"] == pytest.approx(28_000.0 - 1_500.0)
@@ -906,83 +965,282 @@ def test_negotiate_example_basin(basin):
     assert out["environmental_flow_mm3"] == pytest.approx(7_000.0)  # sum of the requirements, information only
     assert out["terminal_environmental_flow_mm3"] == pytest.approx(1_500.0)
     assert out["environmental_reserve_mm3"] == pytest.approx(1_500.0)
-    assert out["claims"] == ALLOC
-    assert list(out["proposal"]) == NAMES
-    assert sum(out["proposal"].values()) == pytest.approx(min(out["estate"], sum(out["claims"].values())))
+    # gross claims are the river demands (not the treaty entitlements); consumptive claims scale by the ratio
+    assert out["claims"] == pytest.approx(RIVER_DEMAND)
+    assert out["consumption_ratio"] == pytest.approx(RATIO)
+    assert out["consumptive_claims"] == pytest.approx(CONSUMPTIVE)
+    assert list(out["proposal"]) == NAMES and list(out["consumptive_awards"]) == NAMES
+    # every consumptive claim fits into the 26 500 estate: full awards, gross caps equal the river demands
+    assert out["consumptive_awards"] == pytest.approx(CONSUMPTIVE)
+    assert out["consumptive_awards"] == pytest.approx(apply_rule("talmud", out["estate"], out["consumptive_claims"]))
+    assert out["total_consumptive_award_mm3"] == pytest.approx(min(out["estate"], sum(CONSUMPTIVE.values())))
+    assert out["total_consumptive_award_mm3"] == pytest.approx(11_468.06, abs=0.01)
+    assert out["proposal"] == pytest.approx(RIVER_DEMAND)
     assert out["total_awarded_mm3"] == pytest.approx(sum(out["proposal"].values()))
-    assert out["proposal"] == pytest.approx(apply_rule("talmud", out["estate"], ALLOC))
-    # Talmud with E = 26 500 > C/2 = 13 750: c/2 + CEL(12 750, c/2) = c/2 + (c/2 - 1000/3)
-    assert out["proposal"] == pytest.approx({"Highland": 6_500.0 / 3, "Midland": 26_000.0 / 3, "Delta": 47_000.0 / 3})
+    assert out["total_awarded_mm3"] == pytest.approx(25_150.0)
     for name in NAMES:
-        assert 0.0 <= out["proposal"][name] <= ALLOC[name] + 1e-9
-    assert isinstance(out["zopa"], bool)
-    assert set(out["acceptable"]) == set(NAMES)
-    assert all(isinstance(v, bool) for v in out["acceptable"].values())
-    assert out["zopa"] == all(out["acceptable"].values())
-    unilateral = route_basin(basin, entitlements={n: None for n in NAMES})
+        assert 0.0 <= out["proposal"][name] <= out["claims"][name] + 1e-9
+    # storage-free BATNA: unilateral upstream-priority withdrawals from this year's flow alone
+    unilateral = route_basin(basin, entitlements={n: None for n in NAMES}, **NO_STORAGE)
     assert out["batna"] == pytest.approx(unilateral.withdrawals_by_riparian())
+    assert out["batna"] == pytest.approx(RIVER_DEMAND)
     for name in NAMES:
         assert out["acceptable"][name] == (out["proposal"][name] >= out["batna"][name] - 1e-6)
-    # at mean flow the upstream riparians now accept; Delta's unilateral 16 300 exceeds its 16 000 claim
-    assert out["acceptable"] == {"Highland": True, "Midland": True, "Delta": False} and out["zopa"] is False
-    assert out["satisfaction"] == pytest.approx(satisfaction(out["proposal"], ALLOC))
+    assert all(isinstance(v, bool) for v in out["acceptable"].values()) and isinstance(out["zopa"], bool)
+    assert out["acceptable"] == {"Highland": True, "Midland": True, "Delta": True} and out["zopa"] is True
+    assert out["satisfaction"] == pytest.approx(satisfaction(out["proposal"], out["claims"]))
+    assert out["satisfaction"] == pytest.approx({n: 1.0 for n in NAMES})
     assert 0.0 <= out["gini"] <= 1.0 and out["gini"] == pytest.approx(gini(out["proposal"]))
-    assert 0.0 <= out["gini_satisfaction"] <= 1.0
-    routed = route_basin(basin, entitlements=out["proposal"])
+    assert out["gini_satisfaction"] == pytest.approx(0.0)
+    routed = route_basin(basin, entitlements=out["proposal"], **NO_STORAGE)
     assert out["routed_withdrawals"] == pytest.approx(routed.withdrawals_by_riparian())
+    assert out["routed_consumption"] == pytest.approx({r.name: r.total_consumption() for r in routed.reaches})
+    assert sum(out["routed_consumption"].values()) == pytest.approx(sum(CONSUMPTIVE.values()))
+    assert sum(out["routed_consumption"].values()) <= out["estate"] + 1e-6
     assert out["outflow_to_sea_mm3"] == pytest.approx(routed.outflow_to_sea_mm3)
+    assert out["outflow_to_sea_mm3"] == pytest.approx(28_000.0 - sum(CONSUMPTIVE.values()))
+    assert out["env_flow_met_share"] == 1.0
     for name in NAMES:
         assert out["routed_withdrawals"][name] <= out["proposal"][name] + 1e-9
 
 
+def test_negotiate_drought_without_rationing(basin):
+    """Flow factor 0.6: the 15 300 estate still covers the 11 468 consumptive claims - no rationing, ZOPA."""
+    out = negotiate(basin, 0.6)
+    assert out["estate"] == pytest.approx(15_300.0)
+    assert sum(out["consumptive_claims"].values()) < out["estate"]
+    assert out["consumptive_awards"] == pytest.approx(CONSUMPTIVE)
+    assert out["proposal"] == pytest.approx(RIVER_DEMAND)
+    assert out["satisfaction"] == pytest.approx({n: 1.0 for n in NAMES})
+    # upstream riparians withdraw their river demand unilaterally; Delta is short of inflow:
+    # Q_Delta 16 800 - upstream consumption (549.7 + 3 322.2) = 12 928.1 < 16 300
+    delta_inflow = 16_800.0 - CONSUMPTIVE["Highland"] - CONSUMPTIVE["Midland"]
+    assert out["batna"] == pytest.approx({"Highland": 1_500.0, "Midland": 7_350.0, "Delta": delta_inflow})
+    assert out["batna"]["Delta"] == pytest.approx(12_928.09, abs=0.01)
+    assert out["zopa"] is True and all(out["acceptable"].values())
+    assert out["routed_withdrawals"]["Delta"] == pytest.approx(delta_inflow)
+    assert sum(out["routed_consumption"].values()) <= out["estate"] + 1e-6
+
+
+def test_negotiate_severe_drought_rations_and_upstream_rejects(basin):
+    """Flow factor 0.4: the 9 700 estate is short of the 11 468 consumptive claims - Talmud rations; the
+    upstream riparians, whose BATNA is their full river demand, reject; Delta (short of inflow when
+    everybody acts unilaterally) accepts."""
+    out = negotiate(basin, 0.4)
+    assert out["estate"] == pytest.approx(9_700.0)
+    c = CONSUMPTIVE
+    total = sum(c.values())
+    # Talmud with E = 9 700 > C/2 = 5 734: c/2 + CEL(E - C/2, c/2).  The total loss C - E = 1 768.1
+    # exceeds three times Highland's half claim (274.9), so Highland gets exactly half and the other
+    # two share the remaining loss equally (746.6 each)
+    half = {n: c[n] / 2 for n in NAMES}
+    loss = (total - 9_700.0 - half["Highland"]) / 2
+    expected_c = {"Highland": half["Highland"], "Midland": c["Midland"] - loss, "Delta": c["Delta"] - loss}
+    assert out["consumptive_awards"] == pytest.approx(expected_c)
+    assert out["consumptive_awards"] == pytest.approx({"Highland": 274.85, "Midland": 2_575.60, "Delta": 6_849.55}, abs=0.01)
+    assert out["total_consumptive_award_mm3"] == pytest.approx(9_700.0)
+    # gross caps = consumptive award / ratio (Highland: half its river demand)
+    assert out["proposal"] == pytest.approx({n: expected_c[n] / RATIO[n] for n in NAMES})
+    assert out["proposal"] == pytest.approx({"Highland": 750.0, "Midland": 5_698.23, "Delta": 14_697.92}, abs=0.01)
+    assert out["total_awarded_mm3"] == pytest.approx(sum(out["proposal"].values()))
+    assert out["satisfaction"] == pytest.approx({n: expected_c[n] / c[n] for n in NAMES})
+    assert out["satisfaction"]["Highland"] == pytest.approx(0.5)
+    # BATNA: Highland and Midland take their full river demand; Delta can only withdraw what still
+    # reaches it: Q_Delta 11 200 - 549.7 - 3 322.2 = 7 328.1
+    assert out["batna"] == pytest.approx({"Highland": 1_500.0, "Midland": 7_350.0, "Delta": 11_200.0 - c["Highland"] - c["Midland"]})
+    assert out["batna"]["Delta"] == pytest.approx(7_328.09, abs=0.01)
+    assert out["acceptable"] == {"Highland": False, "Midland": False, "Delta": True}
+    assert out["zopa"] is False
+    assert out["gini"] == pytest.approx(gini(out["proposal"]))
+    assert out["gini_satisfaction"] > 0.0
+    # the routed caps consume no more than the awards: the cap is pro rata (award / ratio) while the router
+    # fills sectors in SECTOR_PRIORITY order (municipal 0.20, industrial 0.10, energy 0.03, agricultural
+    # 0.60), and every sector served ahead of agriculture has a fraction below each riparian's ratio
+    # (0.366 / 0.452 / 0.466), so a cut removes the high-consumption agricultural water first (this is a
+    # property of the default fractions, not of the conversion - see test_pro_rata_cap_versus_priority_order);
+    # the total never exceeds the estate while the terminal requirement is met; every requirement is met
+    for n in NAMES:
+        assert out["routed_consumption"][n] <= out["consumptive_awards"][n] + 1e-9
+        assert out["routed_withdrawals"][n] <= out["proposal"][n] + 1e-9
+    assert out["routed_withdrawals"]["Highland"] == pytest.approx(750.0)
+    assert sum(out["routed_consumption"].values()) <= out["estate"] + 1e-6
+    assert out["env_flow_met_share"] == 1.0 and out["outflow_to_sea_mm3"] >= 1_500.0 - 1e-9
+    # CEA protects the small upstream claimants in full, so it does find a ZOPA in the same year
+    cea = negotiate(basin, 0.4, "cea")
+    assert cea["proposal"]["Highland"] == pytest.approx(1_500.0) and cea["proposal"]["Midland"] == pytest.approx(7_350.0)
+    assert cea["zopa"] is True
+
+
+def test_negotiate_include_storage_raises_downstream_batna(basin):
+    dry = negotiate(basin, 0.4)
+    wet = negotiate(basin, 0.4, include_storage=True)
+    assert wet["include_storage"] is True
+    # same claims problem and proposal: storage is not part of the estate
+    assert wet["estate"] == dry["estate"] and wet["proposal"] == pytest.approx(dry["proposal"])
+    assert wet["consumptive_awards"] == pytest.approx(dry["consumptive_awards"])
+    # the unilateral alternative now draws on Delta's 6 000 Mm3 reservoir (route_basin defaults)
+    unilateral = route_basin(basin, 0.4, entitlements={n: None for n in NAMES})
+    assert wet["batna"] == pytest.approx(unilateral.withdrawals_by_riparian())
+    # hand check with the default refill fraction 0.25: Highland stores 0.25 * (7 450.3 - 3 000) = 1 112.6 and
+    # Midland 0.25 * (5 815.5 - 2 500) = 828.9 of the river surplus above their requirements, so Delta's inflow
+    # falls from the storage-free 7 328.1 to 5 386.6 and its supply is 5 386.6 + its 6 000 storage = 11 386.6
+    assert wet["batna"]["Delta"] == pytest.approx(11_386.64, abs=0.01)
+    assert wet["batna"]["Delta"] == pytest.approx(dry["batna"]["Delta"] - 1_112.57 - 828.88 + 6_000.0, abs=0.02)
+    assert wet["batna"]["Delta"] > dry["batna"]["Delta"] + 3_000.0
+    assert wet["batna"]["Highland"] == pytest.approx(1_500.0) and wet["batna"]["Midland"] == pytest.approx(7_350.0)
+    assert wet["acceptable"] == {"Highland": False, "Midland": False, "Delta": True} and wet["zopa"] is False
+    # the routed proposal uses the same storage setting
+    routed = route_basin(basin, 0.4, entitlements=wet["proposal"])
+    assert wet["routed_withdrawals"] == pytest.approx(routed.withdrawals_by_riparian())
+    assert wet["routed_consumption"] == pytest.approx({r.name: r.total_consumption() for r in routed.reaches})
+    assert wet["routed_withdrawals"]["Delta"] > dry["routed_withdrawals"]["Delta"]
+    # at zero flow only storage can be withdrawn: the storage-free BATNA is 0, the stored one is not
+    # (Delta's 6 000 Mm3 reservoir exceeds its 1 500 Mm3 requirement; Highland's 3 000 is fully reserved)
+    assert all(v == 0.0 for v in negotiate(basin, 0.0)["batna"].values())
+    assert negotiate(basin, 0.0, include_storage=True)["batna"]["Delta"] > 0.0
+    with pytest.raises(ValueError):
+        negotiate(basin, include_storage="yes")
+
+
+def test_pro_rata_cap_versus_priority_order():
+    """The gross cap is pro rata (award / consumption_ratio) while ``route_basin`` fills the sectors in
+    SECTOR_PRIORITY order, so the routed consumption of a capped riparian is bounded by its award only when
+    no prefix of that order consumes a larger share than the riparian as a whole.  This pins the intended
+    semantics: the example-basin bound (tests above) is a property of the default fractions, and the total
+    consumption stays within the estate exactly when the terminal requirement is met."""
+    # one reach, explicit estate so that the environmental flow does not bind: municipal (served first) 95 %
+    # consumptive, agriculture (served last) 5 % -> ratio 0.5, award 200, cap 400, consumption 0.95 * 400 = 380
+    a = make_riparian("A", local=2_000.0, mun=1_000.0, ag=1_000.0)
+    a.demand.consumption_fraction = {Sector.MUNICIPAL: 0.95, Sector.AGRICULTURAL: 0.05}
+    one = Basin("one", [a])
+    assert consumption_ratio(a) == pytest.approx(0.5)
+    out = negotiate(one, estate=200.0)
+    assert out["consumptive_awards"] == pytest.approx({"A": 200.0})
+    assert out["proposal"] == pytest.approx({"A": 400.0})  # award / ratio, not the priority-order inverse
+    assert out["routed_withdrawals"] == pytest.approx({"A": 400.0})
+    assert out["routed_consumption"] == pytest.approx({"A": 380.0})
+    assert out["routed_consumption"]["A"] > out["consumptive_awards"]["A"]
+    assert sum(out["routed_consumption"].values()) > out["estate"] and out["env_flow_met_share"] == 1.0
+    # the same demands with the default fractions (municipal 0.2 ahead of agriculture 0.6; ratio 0.4): a cut
+    # removes agricultural water first and the capped reach consumes 0.2 * 500 = 100 <= its 200 award
+    a.demand.consumption_fraction = {Sector.MUNICIPAL: 0.2, Sector.AGRICULTURAL: 0.6}
+    out = negotiate(one, estate=200.0)
+    assert out["proposal"] == pytest.approx({"A": 500.0}) and out["routed_consumption"] == pytest.approx({"A": 100.0})
+    assert out["routed_consumption"]["A"] <= out["consumptive_awards"]["A"]
+    # two reaches with the basin's own estate: the upstream over-consumption is paid by the terminal reach,
+    # whose requirement is missed, and the total consumption exceeds the estate by that shortfall
+    up = make_riparian("Up", local=0.0, mun=1_000.0, ag=1_000.0)
+    up.demand.consumption_fraction = {Sector.MUNICIPAL: 0.95, Sector.AGRICULTURAL: 0.05}
+    down = make_riparian("Down", local=0.0, mun=1_000.0, env=50.0)
+    two = Basin("two", [up, down], headwater_inflow_mm3=300.0)
+    for rule in ("proportional", "talmud"):
+        out = negotiate(two, rule=rule)
+        assert out["estate"] == pytest.approx(250.0)
+        assert out["consumptive_claims"] == pytest.approx({"Up": 1_000.0, "Down": 200.0})
+        assert out["proposal"]["Up"] == pytest.approx(out["consumptive_awards"]["Up"] / 0.5)
+        assert out["proposal"]["Up"] >= 300.0 - 1e-9  # the cap does not bind: the 300 Mm3 of inflow do
+        assert out["routed_withdrawals"] == pytest.approx({"Up": 300.0, "Down": 0.0})
+        assert out["routed_consumption"] == pytest.approx({"Up": 285.0, "Down": 0.0})
+        assert out["routed_consumption"]["Up"] > out["consumptive_awards"]["Up"]
+        assert out["outflow_to_sea_mm3"] == pytest.approx(15.0) and out["env_flow_met_share"] == 0.5
+        assert sum(out["routed_consumption"].values()) == pytest.approx(out["estate"] + (50.0 - 15.0))
+    row = compare_allocation_rules(two, rules=["proportional"])["proportional"]
+    assert row["total_consumption_mm3"] == pytest.approx(285.0) and row["total_consumption_mm3"] > row["estate"]
+    # the example basin's bound holds for every rule and flow factor because the terminal requirement is met
+    # (consumption = natural flow - outflow to sea <= natural flow - 1 500 = estate), whatever the caps
+    basin = example_basin()
+    for ff in (0.3, 0.4, 0.5):
+        for rule in RULES:
+            out = negotiate(basin, ff, rule)
+            assert out["env_flow_met_share"] == 1.0
+            assert sum(out["routed_consumption"].values()) == pytest.approx(out["natural_flow_mm3"] - out["outflow_to_sea_mm3"])
+            assert sum(out["routed_consumption"].values()) <= out["estate"] + 1e-6
+            for n in NAMES:
+                assert out["routed_consumption"][n] <= out["consumptive_awards"][n] + 1e-9
+
+
 @pytest.mark.parametrize("rule", list(RULES) + ["adjusted_proportional", "CEA"])
-@pytest.mark.parametrize("ff", [0.0, 0.6, 1.0, 1.5])
+@pytest.mark.parametrize("ff", [0.0, 0.4, 0.6, 1.0, 1.5])
 def test_negotiate_all_rules_sum_to_estate(basin, rule, ff):
     out = negotiate(basin, flow_factor=ff, rule=rule)
     estate = max(28_000.0 * ff - 1_500.0, 0.0)  # natural flow minus the terminal in-stream requirement
+    total_c = sum(CONSUMPTIVE.values())
     assert out["estate"] == pytest.approx(estate)
     assert out["environmental_reserve_mm3"] == pytest.approx(min(1_500.0, 28_000.0 * ff))
-    assert sum(out["proposal"].values()) == pytest.approx(min(estate, sum(ALLOC.values())))
+    assert out["claims"] == pytest.approx(RIVER_DEMAND)
+    assert sum(out["consumptive_awards"].values()) == pytest.approx(min(estate, total_c))
+    assert out["total_consumptive_award_mm3"] == pytest.approx(min(estate, total_c))
+    assert out["total_awarded_mm3"] == pytest.approx(sum(out["proposal"].values()))
     for name in NAMES:
-        assert -1e-9 <= out["proposal"][name] <= ALLOC[name] + 1e-9
+        assert -1e-9 <= out["consumptive_awards"][name] <= CONSUMPTIVE[name] + 1e-9
+        assert -1e-9 <= out["proposal"][name] <= RIVER_DEMAND[name] + 1e-9
+        assert out["proposal"][name] * RATIO[name] == pytest.approx(out["consumptive_awards"][name], abs=1e-6)
+        assert out["satisfaction"][name] == pytest.approx(out["consumptive_awards"][name] / CONSUMPTIVE[name])
+    assert sum(out["routed_consumption"].values()) <= estate + 1e-6
     assert isinstance(out["zopa"], bool)
+    if estate >= total_c:  # no rationing: every claim honoured, nobody below its BATNA
+        assert out["proposal"] == pytest.approx(RIVER_DEMAND) and out["zopa"] is True
 
 
 def test_negotiate_zero_flow(basin):
     out = negotiate(basin, flow_factor=0.0)
     assert out["estate"] == 0.0 and out["environmental_reserve_mm3"] == 0.0
+    assert all(v == 0.0 for v in out["consumptive_awards"].values())
     assert all(v == 0.0 for v in out["proposal"].values())
-    assert all(v == 1.0 or v == pytest.approx(0.0) for v in out["satisfaction"].values())
+    assert all(v == 0.0 for v in out["batna"].values())  # nothing flows and storage is left out
+    assert out["zopa"] is True
+    assert all(v == pytest.approx(0.0) for v in out["satisfaction"].values())
+    assert negotiate(basin, flow_factor=0.0, include_storage=True)["zopa"] is False
 
 
-def test_negotiate_overrides(basin):
-    # claims: demand when there is no treaty entitlement
+def test_negotiate_claim_bases_and_overrides(basin):
+    # treaty basis: the gross claims are the treaty entitlements, consumptive claims scale by the ratio
+    t = negotiate(basin, claim_basis="treaty")
+    assert t["claim_basis"] == "treaty"
+    assert t["claims"] == ALLOC
+    assert t["consumptive_claims"] == pytest.approx({n: ALLOC[n] * RATIO[n] for n in NAMES})
+    assert sum(t["consumptive_claims"].values()) == pytest.approx(12_440.52, abs=0.01)
+    # every treaty claim fits the estate: the proposal reproduces the treaty volumes as gross caps ...
+    assert t["proposal"] == pytest.approx(ALLOC)
+    assert t["satisfaction"] == pytest.approx({n: 1.0 for n in NAMES})
+    # ... but Delta's entitlement is below the 16 300 river demand it withdraws unilaterally
+    assert t["batna"] == pytest.approx(RIVER_DEMAND)
+    assert t["acceptable"] == {"Highland": True, "Midland": True, "Delta": False} and t["zopa"] is False
+    # the treaty basis falls back to the river demand where there is no entitlement
     b = basin.copy()
     for r in b:
         r.treaty_allocation_mm3 = None
-    out = negotiate(b, rule="proportional")
-    assert out["claims"] == pytest.approx({r.name: r.demand.total_withdrawal() for r in b})
-    # partial claims override keeps the others
+    out = negotiate(b, rule="proportional", claim_basis="treaty")
+    assert out["claims"] == pytest.approx(RIVER_DEMAND) and out["zopa"] is True
+    b.riparian("Delta").treaty_allocation_mm3 = 16_000.0
+    out = negotiate(b, claim_basis="treaty")
+    assert out["claims"] == pytest.approx({"Highland": 1_500.0, "Midland": 7_350.0, "Delta": 16_000.0})
+    # explicit (gross) claims override individual entries on either basis
     out = negotiate(basin, claims={"Delta": 10_000.0})
-    assert out["claims"] == {"Highland": 2_500.0, "Midland": 9_000.0, "Delta": 10_000.0}
-    # a generous BATNA override makes the proposal acceptable to everyone
-    out = negotiate(basin, batna={n: 0.0 for n in NAMES})
+    assert out["claims"] == pytest.approx({"Highland": 1_500.0, "Midland": 7_350.0, "Delta": 10_000.0})
+    assert out["consumptive_claims"]["Delta"] == pytest.approx(10_000.0 * RATIO["Delta"])
+    assert out["proposal"]["Delta"] == pytest.approx(10_000.0)  # fits the estate -> capped at its claim
+    assert out["acceptable"]["Delta"] is False  # below the 16 300 it withdraws unilaterally
+    out = negotiate(basin, claims={"Highland": 2_000.0}, claim_basis="treaty")
+    assert out["claims"] == {"Highland": 2_000.0, "Midland": 9_000.0, "Delta": 16_000.0}
+    # a generous BATNA override makes a rationed proposal acceptable to everyone
+    out = negotiate(basin, 0.4, batna={n: 0.0 for n in NAMES})
     assert out["zopa"] is True and all(out["acceptable"].values())
     # a BATNA above the claim can never be met
     out = negotiate(basin, batna={"Highland": 1e9})
     assert out["acceptable"]["Highland"] is False and out["zopa"] is False
-    # explicit estate: the basin's own reserve is still reported
+    # explicit estate: divided among the consumptive claims; the basin's own reserve is still reported
     out = negotiate(basin, estate=100.0)
-    assert out["estate"] == 100.0 and sum(out["proposal"].values()) == pytest.approx(100.0)
+    assert out["estate"] == 100.0 and sum(out["consumptive_awards"].values()) == pytest.approx(100.0)
+    assert sum(out["proposal"].values()) > 100.0  # gross caps exceed the consumptive volume they deliver
     assert out["environmental_reserve_mm3"] == pytest.approx(1_500.0)
-    big = negotiate(basin, estate=1e6)
-    assert big["proposal"] == pytest.approx(ALLOC)  # every claim honoured
-    assert big["acceptable"]["Highland"] is True and big["acceptable"]["Midland"] is True
-    # Delta's unilateral withdrawal (16 300) exceeds its 16 000 claim, so no ZOPA
-    assert big["acceptable"]["Delta"] is False and big["zopa"] is False
+    big = negotiate(basin, 0.4, estate=1e6)
+    assert big["proposal"] == pytest.approx(RIVER_DEMAND) and big["zopa"] is True  # every claim honoured
     # tolerance
     tight = negotiate(basin, batna={n: negotiate(basin)["proposal"][n] + 0.5 for n in NAMES}, tol=1.0)
     assert tight["zopa"] is True
+    loose = negotiate(basin, batna={n: negotiate(basin)["proposal"][n] + 0.5 for n in NAMES}, tol=0.1)
+    assert loose["zopa"] is False
 
 
 def test_negotiate_validation(basin):
@@ -1006,19 +1264,38 @@ def test_negotiate_validation(basin):
         negotiate(basin, claims=[1, 2, 3])
     with pytest.raises(ValueError):
         negotiate("basin")
+    for bad in ("entitlement", "", None, 1, ["demand"]):
+        with pytest.raises(ValueError):
+            negotiate(basin, claim_basis=bad)
+    with pytest.raises(ValueError):
+        negotiate(basin, include_storage=1)
 
 
 def test_negotiate_empty_and_single_basins():
     empty = Basin("empty", [], headwater_inflow_mm3=100.0)
     out = negotiate(empty)
-    assert out["proposal"] == {} and out["zopa"] is True and out["gini"] == 0.0
+    assert out["proposal"] == {} and out["consumptive_awards"] == {} and out["zopa"] is True and out["gini"] == 0.0
     assert out["estate"] == 100.0 and out["terminal_environmental_flow_mm3"] == 0.0
+    assert out["total_consumptive_award_mm3"] == 0.0 and out["routed_consumption"] == {}
     single = Basin("one", [make_riparian("A", local=100.0, mun=30.0, env=20.0)])
     out = negotiate(single, rule="cea")
     assert out["estate"] == pytest.approx(100.0 - 20.0)  # local 100 - env 20 (no headwater; the only reach is terminal)
-    assert out["proposal"] == {"A": 30.0}
+    assert out["claims"] == {"A": 30.0} and out["consumption_ratio"] == pytest.approx({"A": 0.2})
+    assert out["consumptive_claims"] == pytest.approx({"A": 6.0}) and out["consumptive_awards"] == pytest.approx({"A": 6.0})
+    assert out["proposal"] == pytest.approx({"A": 30.0})
     assert out["batna"]["A"] == pytest.approx(30.0)
     assert out["zopa"] is True
+    # a riparian that returns everything (ratio 0) claims nothing consumptively and is capped at its claim
+    single.riparians[0].demand.consumption_fraction = {}
+    out = negotiate(single)
+    assert out["consumption_ratio"] == {"A": 0.0} and out["consumptive_claims"] == {"A": 0.0}
+    assert out["proposal"] == {"A": 30.0} and out["satisfaction"] == {"A": 1.0} and out["zopa"] is True
+    assert out["routed_consumption"] == {"A": 0.0}
+    # a riparian without demand: ratio 1, zero claim and award
+    none = Basin("none", [make_riparian("A", local=100.0, env=20.0)])
+    out = negotiate(none)
+    assert out["consumption_ratio"] == {"A": 1.0} and out["claims"] == {"A": 0.0} and out["proposal"] == {"A": 0.0}
+    assert out["satisfaction"] == {"A": 1.0} and out["zopa"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -1171,84 +1448,132 @@ def test_bankruptcy_estate_properties_and_edge_cases(basin):
 
 
 def test_cooperative_rules_no_longer_manufacture_scarcity(basin):
-    """Review finding: at mean flow the cooperative awards must not cap riparians far below their
-    demand while far more than the terminal requirement flows to the sea."""
+    """Review findings: at mean flow the cooperative awards must not cap riparians below their demand
+    while far more than the terminal requirement flows to the sea, and claims, awards and BATNAs must
+    share one (consumptive) basis so that a year without physical scarcity reports a ZOPA."""
     out = negotiate(basin)  # talmud, mean flow
-    routed = route_basin(basin, entitlements=out["proposal"])
+    routed = route_basin(basin, entitlements=out["proposal"], **NO_STORAGE)
     river_demand = {r.name: r.total_demand() - r.non_river_supply_mm3 for r in routed.reaches}
-    # upstream riparians receive awards above their river demand: uncapped, supply ratio 1
-    assert out["proposal"]["Highland"] > river_demand["Highland"]
-    assert out["proposal"]["Midland"] > river_demand["Midland"]
-    assert routed.reach("Highland").supply_ratio() == pytest.approx(1.0)
-    assert routed.reach("Midland").supply_ratio() == pytest.approx(1.0)
-    assert routed.reach("Delta").supply_ratio() > 0.95
+    assert out["claims"] == pytest.approx(river_demand)
+    for name in NAMES:
+        assert out["proposal"][name] == pytest.approx(river_demand[name])
+        assert routed.reach(name).supply_ratio() == pytest.approx(1.0)
     # consumption of the routed awards never exceeds the (consumptive) estate, every requirement is met
     assert routed.total_consumption() <= out["estate"] + 1e-6
     assert routed.env_flow_met_share() == 1.0
     assert routed.outflow_to_sea_mm3 >= basin.riparian("Delta").demand.environmental
-    # the old estate (natural flow - sum of requirements = 21 000) capped everybody below 90 % of demand
-    old = route_basin(basin, entitlements=apply_rule("talmud", 28_000.0 - 7_000.0, ALLOC))
-    assert all(r.supply_ratio() < 0.9 for r in old.reaches)
-    assert old.outflow_to_sea_mm3 > routed.outflow_to_sea_mm3
+    assert out["zopa"] is True
+    # the previous convention divided the consumptive estate among GROSS treaty claims (27 500) and
+    # compared the gross awards with BATNAs that drew on storage: Delta's 15 667 award fell below the
+    # 16 300 it withdraws unilaterally and no ZOPA was found even at mean flow
+    old = apply_rule("talmud", 26_500.0, ALLOC)
+    stored = route_basin(basin, entitlements={n: None for n in NAMES}).withdrawals_by_riparian()
+    assert old["Delta"] == pytest.approx(47_000.0 / 3) and old["Delta"] < stored["Delta"]
+    # the older estate (natural flow - sum of requirements = 21 000) capped everybody below 90 % of demand
+    older = route_basin(basin, entitlements=apply_rule("talmud", 28_000.0 - 7_000.0, ALLOC), **NO_STORAGE)
+    assert all(r.supply_ratio() < 0.9 for r in older.reaches)
+    assert older.outflow_to_sea_mm3 > routed.outflow_to_sea_mm3
     for rule, row in compare_allocation_rules(basin).items():
-        assert row["supply_ratio"] > 0.95, rule
+        assert row["supply_ratio"] == pytest.approx(1.0), rule
         assert row["env_flow_met_share"] == 1.0, rule
-    # in a 40 % drought Delta's Talmud award more than doubles against the old estate
+    # in a 40 % drought the estate (15 300) still covers the consumptive claims (11 468): no rationing
     dry = negotiate(basin, 0.6)
     assert dry["estate"] == pytest.approx(15_300.0)
-    assert dry["proposal"] == pytest.approx({"Highland": 1_250.0, "Midland": 4_500.0, "Delta": 9_550.0})
-    assert apply_rule("talmud", 28_000.0 * 0.6 - 7_000.0, ALLOC)["Delta"] == pytest.approx(4_275.0)
+    assert dry["proposal"] == pytest.approx(RIVER_DEMAND) and dry["zopa"] is True
+    # the gross-claims convention would have rationed every riparian to about half its entitlement
+    assert apply_rule("talmud", 15_300.0, ALLOC) == pytest.approx({"Highland": 1_250.0, "Midland": 4_500.0, "Delta": 9_550.0})
 
 
 # ---------------------------------------------------------------------------
 # rule comparison
 # ---------------------------------------------------------------------------
 def test_compare_allocation_rules_covers_all_rules(basin):
-    out = compare_allocation_rules(basin)
+    out = compare_allocation_rules(basin, 0.4)  # the rationing year
     assert list(out) == list(RULES)
-    estate = 26_500.0  # 28 000 natural flow - 1 500 terminal in-stream requirement
-    total_claims = sum(ALLOC.values())
+    estate = 9_700.0  # 28 000 * 0.4 natural flow - 1 500 terminal in-stream requirement
+    total_c = sum(CONSUMPTIVE.values())
+    assert estate < total_c
     for rule, row in out.items():
-        assert row["estate"] == pytest.approx(estate) and row["claims"] == ALLOC
-        assert list(row["awards"]) == NAMES
-        assert sum(row["awards"].values()) == pytest.approx(min(estate, total_claims))
+        assert row["estate"] == pytest.approx(estate) and row["claims"] == pytest.approx(RIVER_DEMAND)
+        assert row["consumption_ratio"] == pytest.approx(RATIO)
+        assert row["consumptive_claims"] == pytest.approx(CONSUMPTIVE)
+        assert list(row["awards"]) == NAMES and list(row["consumptive_awards"]) == NAMES
+        assert row["consumptive_awards"] == pytest.approx(apply_rule(rule, estate, CONSUMPTIVE))
+        assert sum(row["consumptive_awards"].values()) == pytest.approx(min(estate, total_c))
+        assert row["total_consumptive_award_mm3"] == pytest.approx(sum(row["consumptive_awards"].values()))
         assert row["total_awarded_mm3"] == pytest.approx(sum(row["awards"].values()))
-        assert row["awards"] == pytest.approx(apply_rule(rule, estate, ALLOC))
         for name in NAMES:
-            assert -1e-9 <= row["awards"][name] <= ALLOC[name] + 1e-9
+            assert -1e-9 <= row["consumptive_awards"][name] <= CONSUMPTIVE[name] + 1e-9
+            assert -1e-9 <= row["awards"][name] <= RIVER_DEMAND[name] + 1e-9
+            assert row["awards"][name] * RATIO[name] == pytest.approx(row["consumptive_awards"][name], abs=1e-6)
+        assert row["satisfaction"] == pytest.approx(satisfaction(row["awards"], RIVER_DEMAND))
         assert 0.0 <= row["gini"] <= 1.0 and 0.0 <= row["gini_satisfaction"] <= 1.0
         assert row["min_satisfaction"] == pytest.approx(min(row["satisfaction"].values()))
         assert 0.0 <= row["min_satisfaction"] <= 1.0
-        bal = route_basin(basin, entitlements=row["awards"])
+        bal = route_basin(basin, 0.4, entitlements=row["awards"], **NO_STORAGE)
         assert row["outflow_to_sea_mm3"] == pytest.approx(bal.outflow_to_sea_mm3)
-        assert row["outflow_to_sea_mm3"] >= 0.0
+        assert row["outflow_to_sea_mm3"] >= 1_500.0 - 1e-9
         assert row["withdrawals"] == pytest.approx(bal.withdrawals_by_riparian())
         assert row["total_withdrawal_mm3"] == pytest.approx(bal.total_withdrawal())
-        assert 0.0 <= row["supply_ratio"] <= 1.0 and 0.0 <= row["env_flow_met_share"] <= 1.0
+        assert row["consumption"] == pytest.approx({r.name: r.total_consumption() for r in bal.reaches})
+        assert row["total_consumption_mm3"] == pytest.approx(bal.total_consumption())
+        assert row["total_consumption_mm3"] <= estate + 1e-6
+        assert 0.0 <= row["supply_ratio"] <= 1.0 and row["env_flow_met_share"] == 1.0
         for name in NAMES:
             assert row["withdrawals"][name] <= row["awards"][name] + 1e-9
     assert out["equal"]["awards"] == pytest.approx(out["cea"]["awards"])
     # proportional is the only rule with equal satisfaction (gini of satisfaction 0)
     assert out["proportional"]["gini_satisfaction"] == pytest.approx(0.0)
     assert out["cel"]["min_satisfaction"] < out["proportional"]["min_satisfaction"]
+    # CEA protects the small upstream claimants in full
+    assert out["cea"]["awards"]["Highland"] == pytest.approx(1_500.0) and out["cea"]["awards"]["Midland"] == pytest.approx(7_350.0)
+    assert out["talmud"]["awards"] == pytest.approx(negotiate(basin, 0.4)["proposal"])
+    # a year without rationing honours every claim under every rule
+    for rule, row in compare_allocation_rules(basin).items():
+        assert row["awards"] == pytest.approx(RIVER_DEMAND), rule
+        assert row["consumptive_awards"] == pytest.approx(CONSUMPTIVE), rule
+        assert row["total_consumption_mm3"] == pytest.approx(sum(CONSUMPTIVE.values())), rule
+        assert row["total_consumption_mm3"] <= row["estate"] + 1e-6
 
 
 def test_compare_allocation_rules_subset_and_options(basin):
-    out = compare_allocation_rules(basin, flow_factor=0.6, rules=["talmud", "proportional"], claims={"Delta": 12_000.0})
+    out = compare_allocation_rules(basin, flow_factor=0.4, rules=["talmud", "proportional"], claims={"Delta": 12_000.0})
     assert list(out) == ["talmud", "proportional"]
-    assert out["talmud"]["estate"] == pytest.approx(28_000.0 * 0.6 - 1_500.0)
+    assert out["talmud"]["estate"] == pytest.approx(28_000.0 * 0.4 - 1_500.0)
     assert out["talmud"]["claims"]["Delta"] == 12_000.0
-    assert out["talmud"]["awards"] == pytest.approx(negotiate(basin, 0.6, "talmud", claims={"Delta": 12_000.0})["proposal"])
+    assert out["talmud"]["consumptive_claims"]["Delta"] == pytest.approx(12_000.0 * RATIO["Delta"])
+    neg = negotiate(basin, 0.4, "talmud", claims={"Delta": 12_000.0})
+    assert out["talmud"]["awards"] == pytest.approx(neg["proposal"])
+    assert out["talmud"]["consumptive_awards"] == pytest.approx(neg["consumptive_awards"])
+    assert out["talmud"]["withdrawals"] == pytest.approx(neg["routed_withdrawals"])
+    assert out["talmud"]["consumption"] == pytest.approx(neg["routed_consumption"])
+    # explicit estate: the consumptive awards exhaust it, the gross caps exceed it
     fixed = compare_allocation_rules(basin, rules=["cea"], estate=1_000.0)
-    assert sum(fixed["cea"]["awards"].values()) == pytest.approx(1_000.0)
+    assert fixed["cea"]["total_consumptive_award_mm3"] == pytest.approx(1_000.0)
+    assert sum(fixed["cea"]["consumptive_awards"].values()) == pytest.approx(1_000.0)
+    assert sum(fixed["cea"]["awards"].values()) > 1_000.0
+    # treaty basis
+    treaty = compare_allocation_rules(basin, rules=["talmud"], claim_basis="treaty")["talmud"]
+    assert treaty["claims"] == ALLOC and treaty["awards"] == pytest.approx(ALLOC)
+    assert treaty["consumptive_claims"] == pytest.approx({n: ALLOC[n] * RATIO[n] for n in NAMES})
+    # storage: same division, the routing may draw on the reservoirs
+    plain = compare_allocation_rules(basin, 0.4, rules=["talmud"])["talmud"]
+    stored = compare_allocation_rules(basin, 0.4, rules=["talmud"], include_storage=True)["talmud"]
+    assert stored["awards"] == pytest.approx(plain["awards"])
+    assert stored["withdrawals"]["Delta"] > plain["withdrawals"]["Delta"]
+    assert stored["withdrawals"] == pytest.approx(route_basin(basin, 0.4, entitlements=stored["awards"]).withdrawals_by_riparian())
     with pytest.raises(ValueError):
         compare_allocation_rules(basin, rules=["nope"])
     with pytest.raises(ValueError):
         compare_allocation_rules(basin, rules=["cea", "cea"])
     with pytest.raises(ValueError):
         compare_allocation_rules(basin, flow_factor=math.inf)
+    with pytest.raises(ValueError):
+        compare_allocation_rules(basin, claim_basis="bogus")
+    with pytest.raises(ValueError):
+        compare_allocation_rules(basin, include_storage="no")
     empty = compare_allocation_rules(Basin("empty", []))
-    assert all(row["awards"] == {} and row["min_satisfaction"] == 1.0 for row in empty.values())
+    assert all(row["awards"] == {} and row["consumptive_awards"] == {} and row["min_satisfaction"] == 1.0 for row in empty.values())
 
 
 # ---------------------------------------------------------------------------
@@ -1275,8 +1600,13 @@ def test_diplomacy_functions_do_not_mutate_inputs(basin):
     conflict_risk_index(basin, bal, treaty, events, climate_cv=0.3)
     benefit_sharing_matrix(basin, bal, route_basin(basin, 0.8), treaty=treaty, events=events)
     negotiate(basin, 0.7, "cel", claims={"Delta": 1.0}, batna={"Delta": 0.0})
+    negotiate(basin, 0.4, claim_basis="treaty", include_storage=True)
     compare_allocation_rules(basin, 0.9)
+    compare_allocation_rules(basin, 0.4, claim_basis="treaty", include_storage=True)
     bankruptcy_estate(basin, 0.4)
+    for r in basin:
+        consumption_ratio(r)
+        river_demand_mm3(r)
     treaty_from_basin(basin)
     assert_unchanged(basin, snapshot)
     assert bal == bal_snapshot
@@ -1286,6 +1616,12 @@ def test_diplomacy_functions_do_not_mutate_inputs(basin):
 
 def test_results_are_independent_copies(basin):
     out = negotiate(basin)
+    out["claims"]["Delta"] = 0.0
+    out["consumptive_claims"]["Delta"] = 0.0
+    out["consumption_ratio"]["Delta"] = 0.0
+    assert basin.riparian("Delta").demand.agricultural == 13_000.0
+    assert negotiate(basin)["claims"]["Delta"] == pytest.approx(16_300.0)
+    out = negotiate(basin, claim_basis="treaty")
     out["claims"]["Delta"] = 0.0
     assert basin.riparian("Delta").treaty_allocation_mm3 == 16_000.0
     t = bare_treaty()

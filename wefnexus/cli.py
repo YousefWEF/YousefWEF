@@ -13,11 +13,12 @@ command          what it does
                  :mod:`wefnexus.viz` (needs matplotlib)
 ``allocate``     divide an estate among claims with a bankruptcy rule
                  (:mod:`wefnexus.allocation`), from explicit ``--claims`` or
-                 from a basin's treaty entitlements / demands; ``--rule all``
-                 compares every rule
-``negotiate``    frame a basin year as a claims problem, test the proposal
-                 against each riparian's BATNA and report the ZOPA
-                 (:func:`wefnexus.diplomacy.negotiate`)
+                 from a basin's river demands / treaty entitlements on a
+                 consumptive basis (:func:`wefnexus.diplomacy.compare_allocation_rules`);
+                 ``--rule all`` compares every rule
+``negotiate``    frame a basin year as a consumptive claims problem, test the
+                 gross proposal against each riparian's BATNA and report the
+                 ZOPA (:func:`wefnexus.diplomacy.negotiate`)
 ``compare``      run several library scenarios and print the comparison table
                  of :func:`wefnexus.scenarios.comparison_table`
 ``pareto``       trace the benefit-equity Pareto front of the allocation LP
@@ -78,6 +79,7 @@ from wefnexus import io as _io
 from wefnexus.allocation import RULES, RULE_ALIASES, compare_rules, gini, satisfaction
 from wefnexus.data import example_basin
 from wefnexus.diplomacy import (
+    CLAIM_BASES,
     Treaty,
     compare_allocation_rules,
     conflict_risk_index,
@@ -935,8 +937,9 @@ def cmd_run(args: argparse.Namespace, out: TextIO) -> int:
 def _allocation_table(
     rules: Mapping[str, Mapping[str, Any]],
     claimants: Sequence[str],
-    extra: Sequence[str] = (),
+    extra: Sequence[Any] = (),
 ) -> str:
+    """Side-by-side awards per rule; ``extra`` lists result keys or ``(column, key)`` pairs."""
     rows = []
     for rule, info in rules.items():
         row: Dict[str, Any] = {"rule": rule}
@@ -945,8 +948,9 @@ def _allocation_table(
         row["total"] = info["total_awarded_mm3"]
         row["gini"] = info["gini"]
         row["min_satisfaction"] = info["min_satisfaction"]
-        for key in extra:
-            row[key] = info.get(key)
+        for item in extra:
+            column, key = (item, item) if isinstance(item, str) else item
+            row[column] = info.get(key)
         rows.append(row)
     return format_table(rows)
 
@@ -955,16 +959,20 @@ def cmd_allocate(args: argparse.Namespace, out: TextIO) -> int:
     """``allocate``: divide an estate among claims with a bankruptcy rule.
 
     With ``--claims`` the problem is explicit (``--estate`` required); with
-    ``--basin`` the claims are the riparians' treaty entitlements (or total
-    withdrawal demands) and the estate is the natural flow times
-    ``--flow-factor`` minus the in-stream requirement at the basin outlet
-    (:func:`wefnexus.diplomacy.bankruptcy_estate`; ``--estate`` overrides),
-    and each rule's awards are also routed through the basin.
+    ``--basin`` the gross claims are the riparians' river demands
+    (``--claims-basis demand``, default) or treaty entitlements
+    (``--claims-basis treaty``), the rules divide the consumptive estate -
+    natural flow times ``--flow-factor`` minus the in-stream requirement at
+    the basin outlet (:func:`wefnexus.diplomacy.bankruptcy_estate`;
+    ``--estate`` overrides) - among the consumptive claims, and each rule's
+    awards are converted into gross withdrawal caps and routed through the
+    basin (:func:`wefnexus.diplomacy.compare_allocation_rules`).
 
     Parameters
     ----------
     args : argparse.Namespace
-        ``rule``, ``claims``, ``basin``, ``estate``, ``flow_factor``, ``json``.
+        ``rule``, ``claims``, ``basin``, ``estate``, ``flow_factor``,
+        ``claims_basis``, ``include_storage``, ``json``.
     out : text stream
 
     Returns
@@ -974,9 +982,14 @@ def cmd_allocate(args: argparse.Namespace, out: TextIO) -> int:
     """
     rule = args.rule
     rules_arg = None if rule == "all" else [rule]
+    consumptive: Optional[Dict[str, float]] = None
     if args.claims is not None:
         if args.estate is None:
             raise CliError("--estate is required with --claims", prog=f"{PROG} allocate")
+        if getattr(args, "claims_basis", None) is not None:
+            raise CliError("--claims-basis is only valid with --basin", prog=f"{PROG} allocate")
+        if getattr(args, "include_storage", False):
+            raise CliError("--include-storage is only valid with --basin", prog=f"{PROG} allocate")
         claims = dict(args.claims)
         estate = float(args.estate)
         awards_by_rule = compare_rules(estate, claims, rules_arg)
@@ -992,20 +1005,39 @@ def cmd_allocate(args: argparse.Namespace, out: TextIO) -> int:
                 "min_satisfaction": float(min(sat.values())) if sat else 1.0,
             }
         source = "explicit claims"
-        extra: Tuple[str, ...] = ()
+        extra: Tuple[Any, ...] = ()
     else:
         basin = load_basin_arg(args.basin)
-        table = compare_allocation_rules(basin, args.flow_factor, rules_arg, estate=args.estate)
+        basis = args.claims_basis or "demand"
+        table = compare_allocation_rules(
+            basin,
+            args.flow_factor,
+            rules_arg,
+            estate=args.estate,
+            claim_basis=basis,
+            include_storage=bool(args.include_storage),
+        )
         first = next(iter(table.values()))
         claims = dict(first["claims"])
+        consumptive = dict(first["consumptive_claims"])
         estate = float(first["estate"])
-        source = f"basin {basin.name!r} at flow factor {args.flow_factor:g}"
-        extra = ("outflow_to_sea_mm3", "env_flow_met_share")
+        source = (
+            f"basin {basin.name!r} at flow factor {args.flow_factor:g}, {basis} claims, "
+            f"storage {'included' if args.include_storage else 'excluded'}"
+        )
+        extra = (("c-total", "total_consumptive_award_mm3"), "outflow_to_sea_mm3", "env_flow_met_share")
 
     total_claims = float(sum(claims.values()))
+    if consumptive is None:
+        claims_text = f"total claims {_fmt(total_claims)}"
+        shortfall = max(total_claims - estate, 0.0)
+    else:
+        total_consumptive = float(sum(consumptive.values()))
+        claims_text = f"total claims {_fmt(total_claims)} (consumptive {_fmt(total_consumptive)})"
+        shortfall = max(total_consumptive - estate, 0.0)
     print(
-        f"Claims problem ({source}): estate {_fmt(estate)} | total claims {_fmt(total_claims)} "
-        f"| shortfall {_fmt(max(total_claims - estate, 0.0))} | claimants {len(claims)}",
+        f"Claims problem ({source}): estate {_fmt(estate)} | {claims_text} "
+        f"| shortfall {_fmt(shortfall)} | claimants {len(claims)}",
         file=out,
     )
     claimants = list(claims)
@@ -1015,19 +1047,22 @@ def cmd_allocate(args: argparse.Namespace, out: TextIO) -> int:
         info = table[rule]
         rows = []
         for name in claimants:
-            row: Dict[str, Any] = {
-                "claimant": name,
-                "claim": claims[name],
-                "award": info["awards"][name],
-                "satisfaction": info["satisfaction"][name],
-            }
+            row: Dict[str, Any] = {"claimant": name, "claim": claims[name]}
+            if consumptive is not None:
+                row["c-claim"] = consumptive[name]
+                row["c-award"] = info["consumptive_awards"][name]
+            row["award"] = info["awards"][name]
+            row["satisfaction"] = info["satisfaction"][name]
             if "withdrawals" in info:
                 row["routed_withdrawal"] = info["withdrawals"][name]
             rows.append(row)
         print(f"rule: {rule}", file=out)
         print(format_table(rows), file=out)
-        line = (
-            f"total awarded {_fmt(info['total_awarded_mm3'])} | gini {info['gini']:.3f} "
+        line = f"total awarded {_fmt(info['total_awarded_mm3'])}"
+        if consumptive is not None:
+            line += f" (consumptive {_fmt(info['total_consumptive_award_mm3'])})"
+        line += (
+            f" | gini {info['gini']:.3f} "
             f"| gini (satisfaction) {info['gini_satisfaction']:.3f} | min satisfaction {info['min_satisfaction']:.3f}"
         )
         if "outflow_to_sea_mm3" in info:
@@ -1037,18 +1072,23 @@ def cmd_allocate(args: argparse.Namespace, out: TextIO) -> int:
             )
         print(line, file=out)
     if args.json:
-        payload = {"source": source, "estate": estate, "claims": claims, "rules": table}
+        payload: Dict[str, Any] = {"source": source, "estate": estate, "claims": claims, "rules": table}
+        if consumptive is not None:
+            payload["consumptive_claims"] = consumptive
+            payload["claim_basis"] = basis
+            payload["include_storage"] = bool(args.include_storage)
         print(f"wrote JSON: {write_json(args.json, payload)}", file=out)
     return EXIT_OK
 
 
 def cmd_negotiate(args: argparse.Namespace, out: TextIO) -> int:
-    """``negotiate``: claims-problem proposal versus BATNAs and the ZOPA.
+    """``negotiate``: consumptive claims-problem proposal versus BATNAs and the ZOPA.
 
     Parameters
     ----------
     args : argparse.Namespace
-        ``basin``, ``flow_factor``, ``rule``, ``estate``, ``json``.
+        ``basin``, ``flow_factor``, ``rule``, ``estate``, ``claims``
+        (claim basis), ``include_storage``, ``json``.
     out : text stream
 
     Returns
@@ -1057,15 +1097,20 @@ def cmd_negotiate(args: argparse.Namespace, out: TextIO) -> int:
         :data:`EXIT_OK`.
     """
     basin = load_basin_arg(args.basin)
-    kw: Dict[str, Any] = {}
+    kw: Dict[str, Any] = {"claim_basis": args.claims, "include_storage": bool(args.include_storage)}
     if args.estate is not None:
         kw["estate"] = args.estate
     res = negotiate(basin, args.flow_factor, args.rule, **kw)
-    print(f"Negotiation: {basin.name} | flow factor {res['flow_factor']:g} | rule {res['rule']}", file=out)
+    print(
+        f"Negotiation: {basin.name} | flow factor {res['flow_factor']:g} | rule {res['rule']} "
+        f"| claims {res['claim_basis']} | storage {'included' if res['include_storage'] else 'excluded'}",
+        file=out,
+    )
     print(
         f"natural flow {_fmt(res['natural_flow_mm3'])} Mm3 | environmental flows {_fmt(res['environmental_flow_mm3'])} Mm3 "
         f"(reserve at the outlet {_fmt(res['environmental_reserve_mm3'])} Mm3) "
-        f"| estate {_fmt(res['estate'])} Mm3 | total claims {_fmt(sum(res['claims'].values()))} Mm3",
+        f"| estate {_fmt(res['estate'])} Mm3 | total claims {_fmt(sum(res['claims'].values()))} Mm3 "
+        f"(consumptive {_fmt(sum(res['consumptive_claims'].values()))} Mm3)",
         file=out,
     )
     rows = []
@@ -1074,6 +1119,8 @@ def cmd_negotiate(args: argparse.Namespace, out: TextIO) -> int:
             {
                 "riparian": name,
                 "claim": res["claims"][name],
+                "c-claim": res["consumptive_claims"][name],
+                "c-award": res["consumptive_awards"][name],
                 "proposal": res["proposal"][name],
                 "batna": res["batna"][name],
                 "satisfaction": res["satisfaction"][name],
@@ -1083,9 +1130,9 @@ def cmd_negotiate(args: argparse.Namespace, out: TextIO) -> int:
         )
     print(format_table(rows), file=out)
     print(
-        f"total awarded {_fmt(res['total_awarded_mm3'])} Mm3 | gini {res['gini']:.3f} "
-        f"| gini (satisfaction) {res['gini_satisfaction']:.3f} | outflow to sea {_fmt(res['outflow_to_sea_mm3'])} Mm3 "
-        f"| env flow met share {res['env_flow_met_share']:.2f}",
+        f"total awarded {_fmt(res['total_awarded_mm3'])} Mm3 (consumptive {_fmt(res['total_consumptive_award_mm3'])} Mm3) "
+        f"| gini {res['gini']:.3f} | gini (satisfaction) {res['gini_satisfaction']:.3f} "
+        f"| outflow to sea {_fmt(res['outflow_to_sea_mm3'])} Mm3 | env flow met share {res['env_flow_met_share']:.2f}",
         file=out,
     )
     if res["zopa"]:
@@ -1387,13 +1434,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--basin",
         default=None,
         metavar="example|PATH.json",
-        help="take the claims (treaty entitlements or demands) and the estate from a basin",
+        help="take the claims (river demands or treaty entitlements, on a consumptive basis) and the estate from a basin",
     )
     p.add_argument(
         "--estate", type=_nonneg_float, default=None, metavar="E", help="estate (Mm3/yr); required with --claims"
     )
     p.add_argument(
         "--flow-factor", type=_nonneg_float, default=1.0, metavar="F", help="natural-flow multiplier with --basin (default 1)"
+    )
+    p.add_argument(
+        "--claims-basis",
+        choices=list(CLAIM_BASES),
+        default=None,
+        help="with --basin: gross claims are the river demands (default) or the treaty entitlements",
+    )
+    p.add_argument(
+        "--include-storage",
+        action="store_true",
+        help="with --basin: let the routed awards draw on the riparians' reservoir storage",
     )
     _add_json(p)
     p.set_defaults(func=cmd_allocate)
@@ -1409,6 +1467,17 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"sharing rule: one of {', '.join(sorted(RULES))} (default: talmud)",
     )
     p.add_argument("--estate", type=_nonneg_float, default=None, metavar="E", help="override the estate (Mm3/yr)")
+    p.add_argument(
+        "--claims",
+        choices=list(CLAIM_BASES),
+        default="demand",
+        help="gross claims: the riparians' river demands (default) or their treaty entitlements",
+    )
+    p.add_argument(
+        "--include-storage",
+        action="store_true",
+        help="let the unilateral BATNA and the routed proposal draw on reservoir storage (default: this year's flow only)",
+    )
     _add_json(p)
     p.set_defaults(func=cmd_negotiate)
 

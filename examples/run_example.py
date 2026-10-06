@@ -19,11 +19,14 @@ The script walks through the whole toolkit:
    prints the comparison table and the sustainability report of every run
    and writes them to CSV;
 4. runs the water-diplomacy toolbox of :mod:`wefnexus.diplomacy`:
-   hydro-hegemony, a Talmud-rule negotiation with BATNA and ZOPA, a
-   comparison of every sharing rule, a treaty with its institutional
-   resilience and compliance, a Basins-at-Risk event record and the
-   conflict risk index in a normal and in a drought year, and the Sadoff &
-   Grey benefit-sharing matrix;
+   hydro-hegemony, a Talmud-rule negotiation with BATNA and ZOPA and a
+   comparison of every sharing rule in a normal, a drought and a severe
+   drought year (only the last one, flow factor 0.4, rations the
+   consumptive claims, so that is the year in which the rules differ), a
+   treaty with its institutional resilience and compliance, a Basins-at-Risk
+   event record and the conflict risk index in a normal and in a drought
+   year, and the Sadoff & Grey benefit-sharing matrix of the severe drought
+   year;
 5. traces the efficiency-equity Pareto front of the LP allocation
    (:func:`wefnexus.optimize.pareto_front`);
 6. writes PNG figures with :mod:`wefnexus.viz` (skipped when matplotlib is
@@ -67,6 +70,15 @@ DEFAULT_PARETO_POINTS = 4 if FAST else 11
 DEFAULT_OUTPUT = HERE / "output"
 SCENARIO_NAMES = ("baseline", "climate_change", "combined_adaptation")
 DROUGHT_FLOW_FACTOR = 0.6
+#: Flow factor at which the consumptive estate falls short of the claims and the sharing rules ration.
+SEVERE_DROUGHT_FLOW_FACTOR = 0.4
+#: The three negotiation / rule-comparison years, label -> flow factor.
+NEGOTIATION_YEARS = (("normal", 1.0), ("drought", DROUGHT_FLOW_FACTOR), ("severe drought", SEVERE_DROUGHT_FLOW_FACTOR))
+
+
+def slug(label: str) -> str:
+    """File-name form of a year label (``"severe drought"`` -> ``"severe_drought"``)."""
+    return label.replace(" ", "_")
 
 TABLE_COLUMNS = (
     "scenario",
@@ -227,31 +239,43 @@ def diplomacy(basin: Basin, balances: Dict[str, Any], results: Dict[str, Any], o
     print(f"Power asymmetry (max - min score): {D.power_asymmetry(basin):.3f}")
 
     # -- negotiation --------------------------------------------------------- #
-    print("\n5b. Negotiation framed as a claims problem (Talmud rule), normal year:")
-    neg = D.negotiate(basin, rule="talmud")
-    out["negotiation"] = neg
-    print(f"Estate (natural flow - environmental flows): {fmt(neg['estate'])} Mm3/yr; "
-          f"claims total {fmt(sum(neg['claims'].values()))} Mm3/yr")
-    rows = [{
-        "riparian": n,
-        "claim_mm3": neg["claims"][n],
-        "proposal_mm3": neg["proposal"][n],
-        "satisfaction": neg["satisfaction"][n],
-        "batna_mm3": neg["batna"][n],
-        "acceptable": neg["acceptable"][n],
-    } for n in basin.names()]
-    table(rows)
-    print(f"Zone of possible agreement: {'yes' if neg['zopa'] else 'no'}; Gini of the proposal {neg['gini']:.3f}; "
-          f"routed outflow to sea {fmt(neg['outflow_to_sea_mm3'])} Mm3/yr")
-    if not neg["zopa"]:
-        print("  (the unilateral upstream-priority BATNA beats the proposal for at least one riparian: the\n"
-              "   estate ignores return flows that the physical routing re-uses downstream, so a credible\n"
-              "   agreement needs side payments / benefit sharing or an estate that counts return flows)")
+    print("\n5b. Negotiation framed as a consumptive claims problem (Talmud rule), normal, drought and severe drought year:")
+    negotiations = {}
+    for label, ff in NEGOTIATION_YEARS:
+        neg = D.negotiate(basin, flow_factor=ff, rule="talmud")
+        negotiations[label] = neg
+        print(f"{label} year (flow factor {ff:g}): estate (natural flow - terminal environmental flow) "
+              f"{fmt(neg['estate'])} Mm3/yr; gross claims (river demands) {fmt(sum(neg['claims'].values()))} Mm3/yr, "
+              f"consumptive claims {fmt(sum(neg['consumptive_claims'].values()))} Mm3/yr")
+        rows = [{
+            "riparian": n,
+            "claim_mm3": neg["claims"][n],
+            "consumptive_claim_mm3": neg["consumptive_claims"][n],
+            "consumptive_award_mm3": neg["consumptive_awards"][n],
+            "proposal_cap_mm3": neg["proposal"][n],
+            "satisfaction": neg["satisfaction"][n],
+            "batna_mm3": neg["batna"][n],
+            "acceptable": neg["acceptable"][n],
+        } for n in basin.names()]
+        table(rows)
+        print(f"Zone of possible agreement: {'yes' if neg['zopa'] else 'no'}; Gini of the proposal {neg['gini']:.3f}; "
+              f"routed outflow to sea {fmt(neg['outflow_to_sea_mm3'])} Mm3/yr")
+        if not neg["zopa"]:
+            print("  (the rule rations the consumptive estate and the unilateral upstream-priority BATNA - the full\n"
+                  "   river demand of an upstream riparian - beats its capped proposal, so a credible agreement\n"
+                  "   needs side payments / benefit sharing, or a rule that protects the small claimants such as CEA)")
+        print()
+    out["negotiation"] = negotiations["normal"]
+    out["negotiation_drought"] = negotiations["drought"]
+    out["negotiation_severe_drought"] = negotiations["severe drought"]
 
     # -- all rules ----------------------------------------------------------- #
-    print(f"\n5c. Sharing rules compared, normal year and drought year (flow factor {DROUGHT_FLOW_FACTOR}):")
+    print(f"\n5c. Sharing rules compared (gross caps per riparian), normal, drought (flow factor {DROUGHT_FLOW_FACTOR}) "
+          f"and severe drought year (flow factor {SEVERE_DROUGHT_FLOW_FACTOR}):\n"
+          "    the consumptive claims fit into the estate down to a flow factor of about 0.46, so every rule honours\n"
+          "    every claim in the first two years and the rules only differ in the severe drought year")
     comparisons = {}
-    for label, ff in (("normal", 1.0), ("drought", DROUGHT_FLOW_FACTOR)):
+    for label, ff in NEGOTIATION_YEARS:
         cmp = D.compare_allocation_rules(basin, ff)
         comparisons[label] = cmp
         rows = []
@@ -260,6 +284,8 @@ def diplomacy(basin: Basin, balances: Dict[str, Any], results: Dict[str, Any], o
                 "year": label,
                 "rule": rule,
                 **{f"award_{n}": row["awards"][n] for n in basin.names()},
+                "consumptive_total_mm3": row["total_consumptive_award_mm3"],
+                "estate_mm3": row["estate"],
                 "gini": row["gini"],
                 "min_satisfaction": row["min_satisfaction"],
                 "routed_supply_ratio": row["supply_ratio"],
@@ -268,9 +294,9 @@ def diplomacy(basin: Basin, balances: Dict[str, Any], results: Dict[str, Any], o
             })
         table(rows)
         print()
-        S.write_table_csv(rows, outdir / f"allocation_rules_{label}.csv")
+        S.write_table_csv(rows, outdir / f"allocation_rules_{slug(label)}.csv")
     out["comparisons"] = comparisons
-    print(f"Wrote {outdir / 'allocation_rules_normal.csv'} and {outdir / 'allocation_rules_drought.csv'}")
+    print("Wrote " + ", ".join(str(outdir / f"allocation_rules_{slug(label)}.csv") for label, _ in NEGOTIATION_YEARS))
 
     # -- treaty, events, conflict risk --------------------------------------- #
     print("\n5d. Treaty, event record and conflict risk (Basins at Risk, Wolf et al. 2003):")
@@ -310,9 +336,11 @@ def diplomacy(basin: Basin, balances: Dict[str, Any], results: Dict[str, Any], o
     print(f"Wrote {outdir / 'conflict_risk.csv'}")
 
     # -- benefit sharing ----------------------------------------------------- #
-    print("\n5e. Benefit sharing (Sadoff & Grey 2002): unilateral use vs the Talmud proposal routed as entitlements")
-    unilateral = route_basin(basin, entitlements={n: None for n in basin.names()})
-    cooperative = route_basin(basin, entitlements=neg["proposal"])
+    print(f"\n5e. Benefit sharing (Sadoff & Grey 2002): unilateral use vs the Talmud proposal routed as entitlements, "
+          f"severe drought year (flow factor {SEVERE_DROUGHT_FLOW_FACTOR}, the year in which the proposal caps anybody)")
+    severe = negotiations["severe drought"]
+    unilateral = route_basin(basin, SEVERE_DROUGHT_FLOW_FACTOR, entitlements={n: None for n in basin.names()})
+    cooperative = route_basin(basin, SEVERE_DROUGHT_FLOW_FACTOR, entitlements=severe["proposal"])
     matrix = D.benefit_sharing_matrix(basin, unilateral, cooperative, treaty=treaty, events=events)
     rows = [{"riparian": n, "to_the_river": m["to_the_river"], "from_the_river_bn_usd": m["from_the_river"] / 1e9,
              "because_of_the_river": m["because_of_the_river"], "beyond_the_river_bn_usd": m["beyond_the_river"] / 1e9,
@@ -375,8 +403,9 @@ def make_plots(basin: Basin, results: Dict[str, Any], dip: Dict[str, Any], front
         save(V.plot_water_balance(res, downstream, basin=basin), f"water_balance_{downstream}_{name}.png")
         save(V.plot_nexus_radar(res.summary()), f"nexus_radar_{name}.png")
     for label, cmp in dip["comparisons"].items():
-        save(V.plot_allocation_rules(cmp, title=f"Allocation rules compared - {label} year"),
-             f"allocation_rules_{label}.png")
+        flow = dict(NEGOTIATION_YEARS)[label]
+        save(V.plot_allocation_rules(cmp, title=f"Allocation rules compared - {label} year (flow factor {flow:g})"),
+             f"allocation_rules_{slug(label)}.png")
     if front:
         save(V.plot_pareto(front, title=f"Efficiency-equity trade-off - drought year (flow factor {DROUGHT_FLOW_FACTOR})"),
              "pareto_front.png")

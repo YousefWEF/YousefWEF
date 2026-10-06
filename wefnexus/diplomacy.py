@@ -25,12 +25,15 @@ indicators:
 * **benefits** - the Sadoff & Grey (2002) typology of benefits *to*, *from*,
   *because of* and *beyond* the river;
 * **negotiation** - :func:`negotiate` frames the basin as a claims problem
-  whose estate (:func:`bankruptcy_estate`) is the natural flow less the
-  in-stream flow that must still reach the sea, applies a sharing rule,
-  compares the proposal with every riparian's BATNA (the unilateral,
-  upstream-priority outcome) and reports whether a zone of possible
-  agreement (ZOPA) exists; :func:`compare_allocation_rules` does so for
-  every rule.
+  on a consumptive basis: the estate (:func:`bankruptcy_estate`) is the
+  natural flow less the in-stream flow that must still reach the sea, the
+  claims are the riparians' river demands (or treaty entitlements) times
+  their consumption ratio (:func:`consumption_ratio`,
+  :func:`river_demand_mm3`), a sharing rule divides the estate, the awards
+  are converted back into gross withdrawal caps and compared with every
+  riparian's BATNA (the unilateral, upstream-priority withdrawal from the
+  same year's flow) to report whether a zone of possible agreement (ZOPA)
+  exists; :func:`compare_allocation_rules` does so for every rule.
 
 Units
 -----
@@ -138,7 +141,10 @@ __all__ = [
     "conflict_risk_index",
     "risk_category",
     "benefit_sharing_matrix",
+    "CLAIM_BASES",
     "bankruptcy_estate",
+    "consumption_ratio",
+    "river_demand_mm3",
     "negotiate",
     "compare_allocation_rules",
 ]
@@ -245,9 +251,15 @@ VARIABILITY_CV_REFERENCE: float = 0.5
 #: Illustrative wholesale value of hydropower, USD per kWh.
 DEFAULT_HYDROPOWER_VALUE_USD_PER_KWH: float = 0.05
 
+#: Bases on which :func:`negotiate` builds the gross claims: the riparians'
+#: river demands (what they ask the river for) or their treaty entitlements.
+CLAIM_BASES: Tuple[str, ...] = ("demand", "treaty")
+
 _M3_PER_MM3 = 1.0e6
 _KWH_PER_GWH = 1.0e6
 _ENV_TOL = 1e-9
+#: Relative tolerance below which a consumptive award counts as the full claim.
+_AWARD_TOL = 1e-9
 
 
 # ---------------------------------------------------------------------------
@@ -1732,14 +1744,22 @@ def bankruptcy_estate(basin: Basin, flow_factor: float = 1.0) -> Dict[str, Any]:
     upstream riparians below their demands while far more than the terminal
     requirement flows to the sea.
 
-    The estate ignores reservoir storage and, being consumptive, is a
-    conservative bound when the awards are applied as *withdrawal* caps
-    (consumption never exceeds withdrawal, so routed awards can never
-    consume more than the estate in aggregate, while return flows let the
-    actual withdrawals exceed it).  Where a claimant's water may physically
-    be taken is not captured by a single number: ``headroom_mm3`` reports
-    the cumulative consumption each outlet allows and
-    :func:`wefnexus.water.route_basin` enforces it when awards are routed.
+    The estate ignores reservoir storage: it is the water a single year's
+    flow can divide.  It bounds the *consumptive* awards of
+    :func:`negotiate`, not the gross withdrawals: the caps handed to
+    :func:`wefnexus.water.route_basin` are ``award / consumption_ratio``
+    and their sum exceeds the estate by the return flows (example basin at
+    flow factor 0.4: caps of 21 146 Mm3/yr for an estate of 9 700).  What
+    keeps the aggregate consumption of the routed caps within the estate is
+    the physical routing, which consumes at most ``supply - env`` in every
+    reach: with storage excluded the mass balance reads ``natural_flow =
+    consumption + outflow_to_sea``, so as long as the terminal requirement is
+    met, ``consumption <= natural_flow - env_terminal = estate`` whatever
+    the caps (and when upstream use leaves the terminal reach short, the
+    total consumption exceeds the estate by the shortfall).  Where a
+    claimant's water may physically be taken is not captured by a single
+    number either: ``headroom_mm3`` reports the cumulative consumption each
+    outlet allows and ``route_basin`` enforces it when the caps are routed.
 
     Parameters
     ----------
@@ -1816,36 +1836,162 @@ def bankruptcy_estate(basin: Basin, flow_factor: float = 1.0) -> Dict[str, Any]:
     }
 
 
+def consumption_ratio(riparian: Riparian) -> float:
+    """Share of a gross withdrawal that the riparian consumes (dimensionless).
+
+    ``ratio = sum_s f_s d_s / sum_s d_s`` over the withdrawal sectors of
+    ``riparian.demand`` (municipal, industrial, energy, agricultural), with
+    ``d_s`` the sector demand in Mm3/yr and ``f_s = demand.consumption_fraction[s]``
+    the share of that sector's withdrawal that is evaporated or embedded in
+    products rather than returned to the river (a sector missing from the
+    mapping counts as 0: fully returned).  It converts between the two
+    bases on which water can be claimed or awarded::
+
+        consumptive volume = gross withdrawal * ratio
+
+    The ratio is invariant to the pro-rata non-river offset applied by
+    :func:`wefnexus.water.route_basin` (groundwater abstraction and
+    desalination reduce every sector's river demand by the same share, so
+    the demand-weighted mean fraction is unchanged); it therefore applies
+    equally to the gross demand and to the river demand of
+    :func:`river_demand_mm3`.  A riparian without any withdrawal demand
+    returns ``1.0`` (nothing would be returned to the river).
+
+    Parameters
+    ----------
+    riparian : Riparian
+        Riparian (never mutated).
+
+    Returns
+    -------
+    float
+        Ratio in ``[0, 1]``.
+
+    Raises
+    ------
+    ValueError
+        On a negative demand or a consumption fraction outside ``[0, 1]``.
+    """
+    if not isinstance(riparian, Riparian):
+        raise ValueError(f"riparian must be a wefnexus.models.Riparian, got {type(riparian).__name__}")
+    label = f"riparian {riparian.name!r}"
+    fractions = riparian.demand.consumption_fraction
+    total = 0.0
+    consumed = 0.0
+    for s, v in riparian.demand.withdrawals().items():
+        d = _nonneg(v, f"{label} demand.{s.value}")
+        f = _fraction(fractions.get(s, 0.0), f"{label} demand.consumption_fraction[{s.value}]")
+        total += d
+        consumed += d * f
+    if total <= 0.0:
+        return 1.0
+    return float(min(max(consumed / total, 0.0), 1.0))
+
+
+def river_demand_mm3(riparian: Riparian) -> float:
+    """Gross withdrawal demand the riparian places on the river, Mm3/yr.
+
+    ``max(sum_s d_s - non_river, 0)`` with ``non_river =
+    groundwater_abstraction_mm3 + energy.desalination_capacity_mm3``: the
+    total withdrawal demand net of the supply that does not come from the
+    river.  :func:`wefnexus.water.route_basin` deducts the same non-river
+    supply pro rata across sectors (``river_demand[s] = d_s * (1 -
+    min(non_river, D) / D)``), which leaves the total unchanged, so this is
+    exactly the sum of the ``river_demand`` the router tries to serve for
+    the riparian (and of :meth:`wefnexus.water.ReachResult.river_demand`).
+    It is the default (``claim_basis="demand"``) gross claim of
+    :func:`negotiate`.
+
+    Parameters
+    ----------
+    riparian : Riparian
+        Riparian (never mutated).
+
+    Returns
+    -------
+    float
+        River demand in Mm3/yr (``>= 0``).
+
+    Raises
+    ------
+    ValueError
+        On a negative demand, groundwater abstraction or desalination
+        capacity.
+    """
+    if not isinstance(riparian, Riparian):
+        raise ValueError(f"riparian must be a wefnexus.models.Riparian, got {type(riparian).__name__}")
+    label = f"riparian {riparian.name!r}"
+    total = sum(_nonneg(v, f"{label} demand.{s.value}") for s, v in riparian.demand.withdrawals().items())
+    non_river = _nonneg(riparian.groundwater_abstraction_mm3, f"{label} groundwater_abstraction_mm3") + _nonneg(
+        riparian.energy.desalination_capacity_mm3, f"{label} energy.desalination_capacity_mm3"
+    )
+    return float(max(total - non_river, 0.0))
+
+
+def _check_claim_basis(claim_basis: Any) -> str:
+    if not isinstance(claim_basis, str) or claim_basis.strip().lower() not in CLAIM_BASES:
+        raise ValueError(f"claim_basis must be one of {list(CLAIM_BASES)}, got {claim_basis!r}")
+    return claim_basis.strip().lower()
+
+
 def _claims_problem(
     basin: Basin,
     flow_factor: float,
     claims: Optional[Mapping[str, float]],
     estate: Optional[float],
-) -> Tuple[Dict[str, float], float, Dict[str, Any]]:
-    """Return ``(claims, estate, estate_info)`` for a basin year.
+    claim_basis: str = "demand",
+) -> Tuple[Dict[str, float], Dict[str, float], Dict[str, float], float, Dict[str, Any]]:
+    """Return ``(claims, consumptive_claims, ratios, estate, estate_info)`` for a basin year.
 
-    ``estate_info`` is the :func:`bankruptcy_estate` result; ``estate`` is
-    its ``"estate"`` unless an explicit non-negative ``estate`` is given.
+    ``claims`` are gross withdrawals (Mm3/yr): with ``claim_basis="demand"``
+    the river demand of every riparian (:func:`river_demand_mm3`), with
+    ``"treaty"`` its ``treaty_allocation_mm3`` (falling back to the river
+    demand when ``None``); an explicit ``claims`` mapping overrides
+    individual entries.  ``consumptive_claims = claims * ratios`` with
+    ``ratios`` from :func:`consumption_ratio`.  ``estate_info`` is the
+    :func:`bankruptcy_estate` result; ``estate`` is its ``"estate"`` unless
+    an explicit non-negative ``estate`` is given.
     """
+    basis = _check_claim_basis(claim_basis)
     names = basin.names()
     overrides = _per_riparian(claims, names, "claims")
-    out_claims: Dict[str, float] = {}
+    gross: Dict[str, float] = {}
+    ratios: Dict[str, float] = {}
     for r in basin.riparians:
-        label = f"riparian {r.name!r}"
+        ratios[r.name] = consumption_ratio(r)
         if r.name in overrides and overrides[r.name] is not None:
-            out_claims[r.name] = _nonneg(overrides[r.name], f"claims[{r.name!r}]")
-        elif r.treaty_allocation_mm3 is not None:
-            out_claims[r.name] = _nonneg(r.treaty_allocation_mm3, f"{label} treaty_allocation_mm3")
+            gross[r.name] = _nonneg(overrides[r.name], f"claims[{r.name!r}]")
+        elif basis == "treaty" and r.treaty_allocation_mm3 is not None:
+            gross[r.name] = _nonneg(r.treaty_allocation_mm3, f"riparian {r.name!r} treaty_allocation_mm3")
         else:
-            out_claims[r.name] = sum(
-                _nonneg(v, f"{label} demand.{s.value}") for s, v in r.demand.withdrawals().items()
-            )
+            gross[r.name] = river_demand_mm3(r)
+    consumptive = {name: float(gross[name] * ratios[name]) for name in names}
     info = bankruptcy_estate(basin, flow_factor)
     if estate is None:
         estate_v = info["estate"]
     else:
         estate_v = _nonneg(estate, "estate")
-    return out_claims, float(estate_v), info
+    return gross, consumptive, ratios, float(estate_v), info
+
+
+def _gross_award(award: float, claim: float, consumptive_claim: float, ratio: float) -> float:
+    """Gross withdrawal cap delivering a consumptive ``award`` (``award / ratio``, clipped to ``[0, claim]``).
+
+    An award equal to the consumptive claim (within :data:`_AWARD_TOL`
+    relative) returns the gross claim exactly, so a cap never binds in a year
+    without rationing; a riparian whose ratio is 0 consumes nothing and is
+    capped at its claim.
+    """
+    if award >= consumptive_claim - _AWARD_TOL * max(consumptive_claim, 1.0) or ratio <= 0.0:
+        return float(claim)
+    return float(min(max(award / ratio, 0.0), claim))
+
+
+def _routing_options(names: Sequence[str], include_storage: bool) -> Dict[str, Any]:
+    """``route_basin`` keywords giving the storage convention of :func:`negotiate`."""
+    if include_storage:
+        return {}
+    return {"storages": {name: 0.0 for name in names}, "reservoir_refill_fraction": 0.0}
 
 
 def negotiate(
@@ -1857,42 +2003,92 @@ def negotiate(
     *,
     estate: Optional[float] = None,
     tol: float = 1e-6,
+    claim_basis: str = "demand",
+    include_storage: bool = False,
 ) -> Dict[str, Any]:
     """Frame a basin year as a claims problem and test a proposal against BATNAs.
 
-    1. **Claims**: each riparian's treaty entitlement
-       (``treaty_allocation_mm3``) or, failing that, its total withdrawal
-       demand; ``claims`` overrides individual entries.
+    The division is done on a *consumptive* basis - the net-use accounting
+    of river sharing problems (Ansink & Weikard 2012) and of the bankruptcy
+    approach of Mianabadi et al. (2014), and the convention of
+    :meth:`wefnexus.nexus.NexusModel.entitlements` - and then converted back
+    into gross withdrawal caps that can be routed and compared with gross
+    unilateral withdrawals:
+
+    1. **Claims** (gross withdrawals, Mm3/yr): with ``claim_basis="demand"``
+       (default) each riparian's river demand - its withdrawal demand net of
+       groundwater and desalination (:func:`river_demand_mm3`); with
+       ``"treaty"`` its treaty entitlement (``treaty_allocation_mm3``),
+       falling back to the river demand where there is none.  ``claims``
+       overrides individual entries (gross values).  The **consumptive
+       claim** is ``claim * ratio`` with ``ratio`` the demand-weighted
+       consumption fraction of :func:`consumption_ratio`: return flows are
+       not claimed, they stay in the river for the riparians below.
     2. **Estate**: the water the basin can consume without violating an
        in-stream requirement - ``natural flow * flow_factor`` minus the
        environmental flow that must still be in the river at the terminal
        outlet, floored at 0 (:func:`bankruptcy_estate`) - or ``estate`` if
-       given.  Upstream requirements are *not* subtracted as well: the water
-       they keep in the river is an in-stream flow, not a withdrawal, and
-       stays available to the riparians below.
-    3. **Proposal**: ``allocation.apply_rule(rule, estate, claims)`` - a
-       bankruptcy-rule division of the estate (Mianabadi et al. 2014).
+       given.  Reservoir storage is not counted: the year's flow is the pie.
+    3. **Proposal**: ``consumptive_awards = apply_rule(rule, estate,
+       consumptive_claims)`` (a bankruptcy-rule division), converted into
+       gross withdrawal caps ``proposal = consumptive_award / ratio`` clipped
+       to ``[0, claim]`` (a riparian whose consumptive claim is fully met is
+       capped exactly at its gross claim).
     4. **BATNA** (best alternative to a negotiated agreement, Fisher & Ury
-       1981): each riparian's surface withdrawal under unilateral,
+       1981): each riparian's gross surface withdrawal under unilateral,
        upstream-priority use - :func:`wefnexus.water.route_basin` with every
-       entitlement removed (Ansink & Weikard 2012); ``batna`` overrides
-       individual entries.
-    5. **ZOPA**: the proposal is acceptable to a riparian when its award is
-       at least its BATNA withdrawal (within ``tol`` Mm3); a zone of possible
-       agreement exists when every riparian accepts.
+       entitlement removed (the Harmon-doctrine outcome of Ansink & Weikard
+       2012) and, by default, with empty reservoirs and no refill so that the
+       alternative draws on the same pie as the estate (this year's flow);
+       ``include_storage=True`` lets the unilateral use (and the routed
+       proposal) draw on the riparians' actual reservoir storage.  ``batna``
+       overrides individual entries.
+    5. **ZOPA**: the proposal is acceptable to a riparian when its gross cap
+       is at least its BATNA withdrawal (within ``tol`` Mm3); a zone of
+       possible agreement exists when every riparian accepts.
 
-    The proposal is also routed through the basin as entitlements to report
-    the withdrawals it would actually deliver.
+    The proposal is also routed through the basin as entitlements (same
+    storage setting) to report the withdrawals and consumption it would
+    actually deliver.  The cap is pro rata (one ratio per riparian) whereas
+    the router fills the sectors in :data:`~wefnexus.models.SECTOR_PRIORITY`
+    order (municipal, industrial, energy, agricultural), so a capped
+    riparian consumes ``sum_s f_s w_s`` over the sectors it fills before the
+    cap binds.  That is at most its consumptive award whenever no prefix of
+    the priority order has a demand-weighted consumption fraction above the
+    riparian's ratio - in particular when every sector served ahead of the
+    last one has a fraction at or below the ratio, as on the example basin
+    with the default fractions (0.20 / 0.10 / 0.03 ahead of agriculture's
+    0.60; ratios 0.37 / 0.45 / 0.47), where a cut therefore removes the
+    high-consumption agricultural water first.  A riparian whose
+    high-fraction sector is served first (say municipal with ``f = 0.95``)
+    consumes more than its award within its cap.  Independently of the
+    caps, the routing consumes at most ``supply - env`` in every reach, so
+    the total routed consumption stays within the estate whenever the
+    terminal requirement is met and storage is excluded (mass balance:
+    natural flow = consumption + outflow to sea); it can exceed the estate
+    when ``include_storage=True`` draws down the reservoirs or when upstream
+    over-consumption leaves the terminal reach short.
+    :meth:`wefnexus.nexus.NexusModel.entitlements` inverts each award sector
+    by sector in priority order instead and has the per-riparian guarantee
+    by construction.
 
-    Note that the estate is a *consumptive* volume that ignores reservoir
-    storage and return flows, whereas the awards are applied as withdrawal
-    caps and the BATNA is a withdrawal: the physical routing re-uses return
-    flows downstream, so in a basin whose withdrawals rely on them a
-    riparian's unilateral BATNA withdrawal can exceed even its own claim
-    (the terminal riparian of the example basin withdraws 16 300 Mm3/yr
-    against a 16 000 Mm3/yr entitlement) and no ZOPA is reported; pass
-    ``estate`` to negotiate over a different pie (e.g. a treaty's reference
-    flow).
+    *Why demand is the default claim basis.*  A claim is what a party asks
+    for, and a riparian asks the river for the water its sectors need; a
+    treaty entitlement is itself a negotiated *outcome* - using it as a
+    claim re-divides a past settlement rather than the parties' needs.  Pass
+    ``claim_basis="treaty"`` to renegotiate from the existing entitlements.
+
+    Because claims, awards and BATNAs are on one consistent basis, a rule
+    only rations under physical scarcity, and with demand claims a year
+    whose consumptive claims fit into the estate honours every claim and
+    reports a ZOPA (a riparian's unilateral withdrawal never exceeds its
+    river demand).  With treaty or explicit claims a riparian whose claim
+    lies below its river demand can still reject without any scarcity
+    (example basin, treaty basis, mean flow: Delta's 16 000 Mm3 entitlement
+    against the 16 300 Mm3 it withdraws unilaterally).  Under rationing an
+    upstream riparian - whose unilateral BATNA is its full river demand -
+    rejects any award below it, which is the leverage that makes side
+    payments and benefit sharing (:func:`benefit_sharing_matrix`) necessary.
 
     Parameters
     ----------
@@ -1904,34 +2100,50 @@ def negotiate(
         Sharing rule accepted by :func:`wefnexus.allocation.apply_rule`
         (default ``"talmud"``).
     claims : mapping, optional
-        ``{riparian: claim}`` overrides (Mm3/yr).
+        ``{riparian: gross claim}`` overrides (Mm3/yr).
     batna : mapping, optional
         ``{riparian: disagreement withdrawal}`` overrides (Mm3/yr).
     estate : float, optional
-        Explicit estate (Mm3/yr) instead of the natural-flow estimate.
+        Explicit consumptive estate (Mm3/yr) instead of the natural-flow
+        estimate.
     tol : float, optional
         Absolute tolerance (Mm3/yr) in the acceptability test.
+    claim_basis : {"demand", "treaty"}, optional
+        Source of the gross claims (see step 1); default ``"demand"``.
+    include_storage : bool, optional
+        Let the BATNA routing and the routed proposal draw on the riparians'
+        reservoir storage (``route_basin`` defaults) instead of this year's
+        flow only (default False).
 
     Returns
     -------
     dict
-        ``rule`` (canonical name), ``flow_factor``, ``natural_flow_mm3``,
+        ``rule`` (canonical name), ``flow_factor``, ``claim_basis``,
+        ``include_storage``, ``natural_flow_mm3``,
         ``environmental_flow_mm3`` (sum of every reach's requirement,
         information only), ``terminal_environmental_flow_mm3`` (the
         requirement at the terminal outlet), ``environmental_reserve_mm3``
         (natural flow minus the basin's own estate - the water withheld
         from the claimants, reported even when ``estate`` is overridden),
-        ``estate``, ``claims``,
-        ``proposal``, ``total_awarded_mm3`` (``== min(estate, sum claims)``),
-        ``batna``, ``acceptable`` (``{riparian: bool}``), ``zopa`` (bool),
-        ``gini`` (of the awards), ``gini_satisfaction``, ``satisfaction``
-        (award / claim), ``routed_withdrawals``, ``outflow_to_sea_mm3`` and
-        ``env_flow_met_share`` of the routed proposal.
+        ``estate``, ``claims`` (gross), ``consumption_ratio``,
+        ``consumptive_claims``, ``consumptive_awards``,
+        ``total_consumptive_award_mm3`` (``== min(estate, sum consumptive
+        claims)``), ``proposal`` (gross withdrawal caps),
+        ``total_awarded_mm3`` (sum of the gross proposal), ``batna``,
+        ``acceptable`` (``{riparian: bool}``), ``zopa`` (bool), ``gini``
+        (of the gross proposal), ``gini_satisfaction``, ``satisfaction``
+        (``proposal / claim``, which equals ``consumptive award /
+        consumptive claim``), ``routed_withdrawals``, ``routed_consumption``
+        (per riparian; within the estate in total whenever the terminal
+        requirement is met and storage is excluded, see above),
+        ``outflow_to_sea_mm3`` and ``env_flow_met_share`` of the routed
+        proposal.
 
     Raises
     ------
     ValueError
-        On an unknown rule, unknown riparian names or invalid numbers.
+        On an unknown rule or claim basis, unknown riparian names or
+        invalid numbers.
 
     References
     ----------
@@ -1940,15 +2152,18 @@ def negotiate(
     """
     _check_basin(basin)
     abs_tol = _nonneg(tol, "tol")
-    claims_d, estate_v, info = _claims_problem(basin, flow_factor, claims, estate)
+    storage_flag = _as_bool(include_storage, "include_storage")
+    claims_d, cclaims, ratios, estate_v, info = _claims_problem(basin, flow_factor, claims, estate, claim_basis)
     ff = _nonneg(flow_factor, "flow_factor")
     names = basin.names()
 
-    awards_by_rule = compare_rules(estate_v, claims_d, [rule])
-    rule_name, proposal = next(iter(awards_by_rule.items()))
-    proposal = {name: float(proposal[name]) for name in names}
+    awards_by_rule = compare_rules(estate_v, cclaims, [rule])
+    rule_name, cawards = next(iter(awards_by_rule.items()))
+    cawards = {name: float(cawards[name]) for name in names}
+    proposal = {name: _gross_award(cawards[name], claims_d[name], cclaims[name], ratios[name]) for name in names}
 
-    unilateral = route_basin(basin, ff, entitlements={name: None for name in names})
+    routing = _routing_options(names, storage_flag)
+    unilateral = route_basin(basin, ff, entitlements={name: None for name in names}, **routing)
     batna_d = {name: float(v) for name, v in unilateral.withdrawals_by_riparian().items()}
     for name, value in _per_riparian(batna, names, "batna").items():
         if value is not None:
@@ -1957,16 +2172,22 @@ def negotiate(
     acceptable = {name: bool(proposal[name] >= batna_d[name] - abs_tol) for name in names}
     zopa = all(acceptable.values())
     sat = satisfaction(proposal, claims_d)
-    routed = route_basin(basin, ff, entitlements=proposal)
+    routed = route_basin(basin, ff, entitlements=proposal, **routing)
     return {
         "rule": rule_name,
         "flow_factor": ff,
+        "claim_basis": _check_claim_basis(claim_basis),
+        "include_storage": storage_flag,
         "natural_flow_mm3": info["natural_flow_mm3"],
         "environmental_flow_mm3": info["environmental_flow_mm3"],
         "terminal_environmental_flow_mm3": info["terminal_environmental_flow_mm3"],
         "environmental_reserve_mm3": info["environmental_reserve_mm3"],
         "estate": estate_v,
         "claims": claims_d,
+        "consumption_ratio": ratios,
+        "consumptive_claims": cclaims,
+        "consumptive_awards": cawards,
+        "total_consumptive_award_mm3": float(sum(cawards.values())),
         "proposal": proposal,
         "total_awarded_mm3": float(sum(proposal.values())),
         "batna": batna_d,
@@ -1976,6 +2197,7 @@ def negotiate(
         "gini_satisfaction": gini(list(sat.values())),
         "satisfaction": sat,
         "routed_withdrawals": routed.withdrawals_by_riparian(),
+        "routed_consumption": {r.name: r.total_consumption() for r in routed.reaches},
         "outflow_to_sea_mm3": routed.outflow_to_sea_mm3,
         "env_flow_met_share": routed.env_flow_met_share(),
     }
@@ -1988,14 +2210,19 @@ def compare_allocation_rules(
     *,
     claims: Optional[Mapping[str, float]] = None,
     estate: Optional[float] = None,
+    claim_basis: str = "demand",
+    include_storage: bool = False,
 ) -> Dict[str, Dict[str, Any]]:
     """Apply every sharing rule to the basin's claims problem and route each.
 
-    Claims and estate are built as in :func:`negotiate`; each rule's awards
-    are then used as withdrawal entitlements in
-    :func:`wefnexus.water.route_basin` to see what the basin would actually
-    deliver (upstream riparians can always take their award; downstream
-    ones only if the water arrives).
+    Gross claims, consumptive claims and the estate are built as in
+    :func:`negotiate`; each rule divides the estate among the consumptive
+    claims, the awards are converted into gross withdrawal caps
+    (``award / consumption_ratio``, clipped to the claim) and those caps are
+    used as entitlements in :func:`wefnexus.water.route_basin` (with the
+    storage convention of ``include_storage``) to see what the basin would
+    actually deliver (upstream riparians can always take their cap;
+    downstream ones only if the water arrives).
 
     Parameters
     ----------
@@ -2006,35 +2233,45 @@ def compare_allocation_rules(
     rules : iterable of str or callable, optional
         Rules to compare (default: every rule in
         :data:`wefnexus.allocation.RULES`).
-    claims, estate
+    claims, estate, claim_basis, include_storage
         As in :func:`negotiate`.
 
     Returns
     -------
     dict
-        ``{rule: {"awards", "total_awarded_mm3", "gini", "gini_satisfaction",
-        "satisfaction", "min_satisfaction", "withdrawals",
-        "total_withdrawal_mm3", "supply_ratio", "outflow_to_sea_mm3",
-        "env_flow_met_share"}}`` with ``"estate"`` and ``"claims"`` repeated
-        in every row for convenience.
+        ``{rule: {"estate", "claims" (gross), "consumption_ratio",
+        "consumptive_claims", "consumptive_awards",
+        "total_consumptive_award_mm3", "awards" (gross caps),
+        "total_awarded_mm3", "gini", "gini_satisfaction", "satisfaction",
+        "min_satisfaction", "withdrawals", "total_withdrawal_mm3",
+        "consumption", "total_consumption_mm3", "supply_ratio",
+        "outflow_to_sea_mm3", "env_flow_met_share"}}``.
 
     References
     ----------
-    Thomson (2003); Mianabadi et al. (2014); Madani (2010).
+    Thomson (2003); Mianabadi et al. (2014); Madani (2010); Ansink &
+    Weikard (2012).
     """
     _check_basin(basin)
-    claims_d, estate_v, _ = _claims_problem(basin, flow_factor, claims, estate)
+    storage_flag = _as_bool(include_storage, "include_storage")
+    claims_d, cclaims, ratios, estate_v, _ = _claims_problem(basin, flow_factor, claims, estate, claim_basis)
     ff = _nonneg(flow_factor, "flow_factor")
     names = basin.names()
-    awards_by_rule = compare_rules(estate_v, claims_d, rules)
+    routing = _routing_options(names, storage_flag)
+    awards_by_rule = compare_rules(estate_v, cclaims, rules)
     out: Dict[str, Dict[str, Any]] = {}
-    for rule_name, awards in awards_by_rule.items():
-        awards = {name: float(awards[name]) for name in names}
+    for rule_name, cawards in awards_by_rule.items():
+        cawards = {name: float(cawards[name]) for name in names}
+        awards = {name: _gross_award(cawards[name], claims_d[name], cclaims[name], ratios[name]) for name in names}
         sat = satisfaction(awards, claims_d)
-        bal = route_basin(basin, ff, entitlements=awards)
+        bal = route_basin(basin, ff, entitlements=awards, **routing)
         out[rule_name] = {
             "estate": estate_v,
             "claims": dict(claims_d),
+            "consumption_ratio": dict(ratios),
+            "consumptive_claims": dict(cclaims),
+            "consumptive_awards": cawards,
+            "total_consumptive_award_mm3": float(sum(cawards.values())),
             "awards": awards,
             "total_awarded_mm3": float(sum(awards.values())),
             "gini": gini(awards),
@@ -2043,6 +2280,8 @@ def compare_allocation_rules(
             "min_satisfaction": float(min(sat.values())) if sat else 1.0,
             "withdrawals": bal.withdrawals_by_riparian(),
             "total_withdrawal_mm3": bal.total_withdrawal(),
+            "consumption": {r.name: r.total_consumption() for r in bal.reaches},
+            "total_consumption_mm3": bal.total_consumption(),
             "supply_ratio": bal.supply_ratio(),
             "outflow_to_sea_mm3": bal.outflow_to_sea_mm3,
             "env_flow_met_share": bal.env_flow_met_share(),

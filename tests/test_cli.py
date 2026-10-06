@@ -523,13 +523,21 @@ def test_allocate_all_rules(capsys):
 def test_allocate_from_basin(capsys):
     code, out, err = run_cli(capsys, "allocate", "--basin", "example", "--rule", "talmud")
     assert code == 0 and err == ""
-    # estate = natural flow minus the terminal in-stream requirement (1 500), not minus the 7 000 sum
-    assert "basin 'Azura River (stylised)'" in out and "estate 26,500.0" in out and "total claims 27,500.0" in out
+    # estate = natural flow minus the terminal in-stream requirement (1 500), not minus the 7 000 sum;
+    # gross claims = river demands (1 500 / 7 350 / 16 300), consumptive claims = claims * consumption ratio
+    assert "basin 'Azura River (stylised)'" in out and "demand claims" in out and "storage excluded" in out
+    assert "estate 26,500.0" in out and "total claims 25,150.0 (consumptive 11,468.1)" in out and "shortfall 0.0" in out
     header, rows = table(out, "claimant")
-    assert "routed_withdrawal" in header
+    assert header == ["claimant", "claim", "c-claim", "c-award", "award", "satisfaction", "routed_withdrawal"]
     assert [r["claimant"] for r in rows] == RIPARIANS
-    assert [float(r["claim"]) for r in rows] == pytest.approx([2500.0, 9000.0, 16000.0])
-    assert [float(r["award"]) for r in rows] == pytest.approx([6500.0 / 3, 26000.0 / 3, 47000.0 / 3], abs=0.6)
+    assert [float(r["claim"]) for r in rows] == pytest.approx([1500.0, 7350.0, 16300.0])
+    assert [float(r["c-claim"]) for r in rows] == pytest.approx([549.7, 3322.2, 7596.2], abs=0.6)
+    # no rationing at mean flow: consumptive awards = consumptive claims, gross caps = river demands
+    assert [float(r["c-award"]) for r in rows] == pytest.approx([549.7, 3322.2, 7596.2], abs=0.6)
+    assert [float(r["award"]) for r in rows] == pytest.approx([1500.0, 7350.0, 16300.0], abs=0.6)
+    assert [float(r["routed_withdrawal"]) for r in rows] == pytest.approx([1500.0, 7350.0, 16300.0], abs=0.6)
+    assert all(float(r["satisfaction"]) == pytest.approx(1.0) for r in rows)
+    assert "total awarded 25,150.0 (consumptive 11,468.1)" in out
     assert "outflow to sea" in out and "env flow met share" in out
 
 
@@ -537,10 +545,42 @@ def test_allocate_from_basin_all_rules_and_estate_override(capsys):
     code, out, _ = run_cli(capsys, "allocate", "--basin", "example", "--rule", "all", "--estate", "1000", "--flow-factor", "0.5")
     assert code == 0 and "estate 1,000.0" in out and "flow factor 0.5" in out
     header, rows = table(out, "rule")
-    assert "outflow_to_sea_mm3" in header and "env_flow_met_share" in header
+    assert "c-total" in header and "outflow_to_sea_mm3" in header and "env_flow_met_share" in header
     assert len(rows) == 7
     for r in rows:
-        assert float(r["total"]) == pytest.approx(1000.0, abs=1.0)
+        assert float(r["c-total"]) == pytest.approx(1000.0, abs=1.0)  # the consumptive estate is exhausted
+        assert float(r["total"]) > 1000.0  # the gross caps exceed the consumptive volume they deliver
+
+
+def test_allocate_from_basin_treaty_basis_and_drought(capsys):
+    code, out, _ = run_cli(capsys, "allocate", "--basin", "example", "--claims-basis", "treaty")
+    assert code == 0 and "treaty claims" in out and "total claims 27,500.0 (consumptive 12,440.5)" in out
+    _, rows = table(out, "claimant")
+    assert [float(r["claim"]) for r in rows] == pytest.approx([2500.0, 9000.0, 16000.0])
+    assert [float(r["award"]) for r in rows] == pytest.approx([2500.0, 9000.0, 16000.0], abs=0.6)
+    # flow factor 0.4: the 9 700 estate rations the 11 468 consumptive claims (Talmud)
+    code, out, _ = run_cli(capsys, "allocate", "--basin", "example", "--flow-factor", "0.4", "--rule", "talmud")
+    assert code == 0 and "estate 9,700.0" in out and "shortfall 1,768.1" in out
+    _, rows = table(out, "claimant")
+    assert [float(r["c-award"]) for r in rows] == pytest.approx([274.9, 2575.6, 6849.5], abs=0.6)
+    assert [float(r["award"]) for r in rows] == pytest.approx([750.0, 5698.2, 14697.9], abs=0.6)
+    assert "total awarded 21,146.2 (consumptive 9,700.0)" in out
+    code, out, _ = run_cli(capsys, "allocate", "--basin", "example", "--flow-factor", "0.4", "--include-storage")
+    assert code == 0 and "storage included" in out
+
+
+def test_allocate_from_basin_json(capsys, tmp_path):
+    path = tmp_path / "alloc_basin.json"
+    code, out, _ = run_cli(capsys, "allocate", "--basin", "example", "--flow-factor", "0.4", "--rule", "all", "--json", str(path))
+    assert code == 0 and f"wrote JSON: {path}" in out
+    data = strict_json_load(path)
+    assert data["claim_basis"] == "demand" and data["include_storage"] is False
+    assert data["estate"] == pytest.approx(9700.0) and set(data["consumptive_claims"]) == set(RIPARIANS)
+    row = data["rules"]["talmud"]
+    assert set(row) >= {"claims", "consumptive_claims", "consumptive_awards", "consumption_ratio",
+                        "total_consumptive_award_mm3", "awards", "withdrawals", "consumption"}
+    assert row["total_consumptive_award_mm3"] == pytest.approx(9700.0)
+    assert row["awards"]["Highland"] == pytest.approx(750.0)
 
 
 def test_allocate_from_basin_file(capsys, basin_file):
@@ -576,6 +616,9 @@ def test_allocate_json(capsys, tmp_path):
         ["allocate", "--estate", "1", "--claims", "a=inf"],
         ["allocate", "--estate", "1", "--claims", "a=1", "--rule", "treaty"],
         ["allocate", "--estate", "1", "--claims", "a=1", "--rule", "bogus"],
+        ["allocate", "--estate", "1", "--claims", "a=1", "--claims-basis", "treaty"],
+        ["allocate", "--estate", "1", "--claims", "a=1", "--include-storage"],
+        ["allocate", "--basin", "example", "--claims-basis", "bogus"],
         ["allocate", "--basin", "example", "--flow-factor", "-1"],
         ["allocate", "--basin", "/no/such.json"],
     ],
@@ -592,36 +635,88 @@ def test_negotiate_default(capsys):
     code, out, err = run_cli(capsys, "negotiate", "--basin", "example", "--flow-factor", "1.0", "--rule", "talmud")
     assert code == 0 and err == ""
     assert "Negotiation: Azura River (stylised)" in out and "rule talmud" in out
+    assert "claims demand" in out and "storage excluded" in out
     # estate = natural flow minus the terminal in-stream requirement (1 500), not minus the 7 000 sum
-    assert "natural flow 28,000.0" in out and "environmental flows 7,000.0" in out and "estate 26,500.0" in out
+    assert "natural flow 28,000.0" in out and "environmental flows 7,000.0" in out
+    assert "reserve at the outlet 1,500.0" in out and "estate 26,500.0" in out
+    assert "total claims 25,150.0 Mm3 (consumptive 11,468.1 Mm3)" in out
     header, rows = table(out, "riparian")
-    assert header == ["riparian", "claim", "proposal", "batna", "satisfaction", "acceptable", "routed"]
+    assert header == ["riparian", "claim", "c-claim", "c-award", "proposal", "batna", "satisfaction", "acceptable", "routed"]
     assert [r["riparian"] for r in rows] == RIPARIANS
+    assert [float(r["claim"]) for r in rows] == pytest.approx([1500.0, 7350.0, 16300.0])
+    assert [float(r["c-claim"]) for r in rows] == pytest.approx([549.7, 3322.2, 7596.2], abs=0.6)
     for r in rows:
-        assert r["acceptable"] in ("yes", "no")
-        assert 0.0 <= float(r["satisfaction"]) <= 1.0
-        assert float(r["proposal"]) <= float(r["claim"]) + 1e-6
-    assert sum(float(r["proposal"]) for r in rows) == pytest.approx(26500.0, abs=1.5)
-    assert "ZOPA: no" in out and "BATNA" in out
+        assert r["acceptable"] == "yes"
+        assert float(r["satisfaction"]) == pytest.approx(1.0)
+        assert float(r["c-award"]) == pytest.approx(float(r["c-claim"]), abs=0.6)
+        assert float(r["proposal"]) == pytest.approx(float(r["claim"]), abs=0.6)
+        assert float(r["batna"]) == pytest.approx(float(r["claim"]), abs=0.6)
+        assert float(r["routed"]) == pytest.approx(float(r["claim"]), abs=0.6)
+    assert sum(float(r["proposal"]) for r in rows) == pytest.approx(25150.0, abs=1.5)
+    assert "total awarded 25,150.0 Mm3 (consumptive 11,468.1 Mm3)" in out
+    assert "ZOPA: yes" in out and "BATNA" in out
 
 
 def test_negotiate_drought_year_and_rules(capsys):
+    # flow factor 0.6: the 15 300 estate still covers the consumptive claims -> no rationing, ZOPA
     code, out, _ = run_cli(capsys, "negotiate", "--flow-factor", "0.6", "--rule", "cea")
     assert code == 0 and "flow factor 0.6" in out and "rule cea" in out and "estate 15,300.0" in out
     _, rows = table(out, "riparian")
-    assert sum(float(r["proposal"]) for r in rows) == pytest.approx(15300.0, abs=1.5)
+    assert sum(float(r["c-award"]) for r in rows) == pytest.approx(11468.1, abs=1.5)
+    assert sum(float(r["proposal"]) for r in rows) == pytest.approx(25150.0, abs=1.5)
+    assert all(r["acceptable"] == "yes" for r in rows)
+    assert "ZOPA: yes" in out
 
 
-def test_negotiate_zopa_exists_without_treaty_claims(capsys, tmp_path):
-    """Claims = demands and a large estate: everybody gets its demand >= BATNA."""
+def test_negotiate_severe_drought_has_no_zopa(capsys):
+    # flow factor 0.4: the 9 700 estate rations; the upstream riparians fall below their BATNA
+    code, out, _ = run_cli(capsys, "negotiate", "--flow-factor", "0.4")
+    assert code == 0 and "estate 9,700.0" in out
+    _, rows = table(out, "riparian")
+    by = {r["riparian"]: r for r in rows}
+    assert float(by["Highland"]["proposal"]) == pytest.approx(750.0, abs=0.6)
+    assert float(by["Highland"]["batna"]) == pytest.approx(1500.0, abs=0.6)
+    assert float(by["Midland"]["proposal"]) == pytest.approx(5698.2, abs=0.6)
+    assert float(by["Midland"]["batna"]) == pytest.approx(7350.0, abs=0.6)
+    assert float(by["Delta"]["proposal"]) == pytest.approx(14697.9, abs=0.6)
+    assert float(by["Delta"]["batna"]) == pytest.approx(7328.1, abs=0.6)
+    assert [r["acceptable"] for r in rows] == ["no", "no", "yes"]
+    assert float(by["Highland"]["satisfaction"]) == pytest.approx(0.5)
+    assert sum(float(r["c-award"]) for r in rows) == pytest.approx(9700.0, abs=1.5)
+    assert "total awarded 21,146.2 Mm3 (consumptive 9,700.0 Mm3)" in out
+    assert "ZOPA: no - proposal below the BATNA of Highland, Midland" in out
+    # with reservoir storage Delta's unilateral alternative improves; the upstream riparians still reject
+    code, out2, _ = run_cli(capsys, "negotiate", "--flow-factor", "0.4", "--include-storage")
+    assert code == 0 and "storage included" in out2
+    _, rows2 = table(out2, "riparian")
+    # Delta's supply with the reservoirs: 5 386.6 Mm3 of inflow (the upstream reservoirs refill 1 112.6 and
+    # 828.9 of the surplus above their requirements) plus its 6 000 Mm3 of storage
+    assert float(rows2[2]["batna"]) == pytest.approx(11386.6, abs=0.6)
+    assert float(rows2[2]["batna"]) > float(by["Delta"]["batna"]) + 3000.0
+    assert "ZOPA: no - proposal below the BATNA of Highland, Midland" in out2
+
+
+def test_negotiate_treaty_claims(capsys):
+    code, out, _ = run_cli(capsys, "negotiate", "--claims", "treaty")
+    assert code == 0 and "claims treaty" in out and "total claims 27,500.0 Mm3 (consumptive 12,440.5 Mm3)" in out
+    _, rows = table(out, "riparian")
+    assert [float(r["claim"]) for r in rows] == pytest.approx([2500.0, 9000.0, 16000.0])
+    assert [float(r["proposal"]) for r in rows] == pytest.approx([2500.0, 9000.0, 16000.0], abs=0.6)
+    # Delta's entitlement is below the 16 300 it withdraws unilaterally
+    assert [r["acceptable"] for r in rows] == ["yes", "yes", "no"]
+    assert "ZOPA: no - proposal below the BATNA of Delta" in out
+
+
+def test_negotiate_treaty_basis_falls_back_to_demand(capsys, tmp_path):
+    """``--claims treaty`` on a basin without entitlements: claims = river demands >= every BATNA."""
     b = example_basin()
     for r in b.riparians:
         r.treaty_allocation_mm3 = None
     path = tmp_path / "no_treaty.json"
     IO.basin_to_json(b, path)
-    code, out, _ = run_cli(capsys, "negotiate", "--basin", str(path), "--estate", "100000")
+    code, out, _ = run_cli(capsys, "negotiate", "--basin", str(path), "--claims", "treaty", "--estate", "100000")
     assert code == 0
-    assert "ZOPA: yes" in out
+    assert "ZOPA: yes" in out and "estate 100,000.0" in out and "total claims 25,150.0" in out
     _, rows = table(out, "riparian")
     assert all(r["acceptable"] == "yes" for r in rows)
     assert all(float(r["satisfaction"]) == pytest.approx(1.0) for r in rows)
@@ -632,9 +727,14 @@ def test_negotiate_json(capsys, tmp_path):
     code, out, _ = run_cli(capsys, "negotiate", "--json", str(path))
     assert code == 0 and f"wrote JSON: {path}" in out
     data = strict_json_load(path)
-    assert data["rule"] == "talmud" and data["estate"] == 26500.0
+    assert data["rule"] == "talmud" and data["estate"] == 26500.0 and data["claim_basis"] == "demand"
+    assert data["include_storage"] is False and data["zopa"] is True
     assert set(data["proposal"]) == set(RIPARIANS) and isinstance(data["zopa"], bool)
-    assert set(data) >= {"claims", "batna", "acceptable", "gini", "satisfaction", "routed_withdrawals"}
+    assert set(data) >= {"claims", "consumptive_claims", "consumptive_awards", "consumption_ratio",
+                         "total_consumptive_award_mm3", "total_awarded_mm3", "batna", "acceptable", "gini",
+                         "satisfaction", "routed_withdrawals", "routed_consumption"}
+    assert data["total_consumptive_award_mm3"] == pytest.approx(11468.06, abs=0.01)
+    assert data["total_awarded_mm3"] == pytest.approx(25150.0)
 
 
 @pytest.mark.parametrize(
@@ -645,6 +745,8 @@ def test_negotiate_json(capsys, tmp_path):
         ["negotiate", "--rule", "treaty"],
         ["negotiate", "--rule", "all"],
         ["negotiate", "--estate", "-5"],
+        ["negotiate", "--claims", "bogus"],
+        ["negotiate", "--claims", "a=1"],
         ["negotiate", "--basin", "/no/such.json"],
     ],
 )
