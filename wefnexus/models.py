@@ -14,9 +14,11 @@ modules (``water``, ``energy``, ``food``, ``allocation``, ``diplomacy``,
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+import math
+import numbers
+from dataclasses import dataclass, field, fields, replace
 from enum import Enum
-from typing import Dict, Iterator, List, Optional
+from typing import Dict, Iterable, Iterator, List, Optional, Union
 
 __all__ = [
     "Sector",
@@ -70,6 +72,18 @@ DEFAULT_VALUE_USD_PER_M3: Dict[Sector, float] = {
     Sector.AGRICULTURAL: 0.10,
 }
 
+#: :class:`WaterDemand` attribute holding each sector's annual volume.  The
+#: enum value and the field name coincide for every withdrawal sector but
+#: differ for the in-stream requirement (``"environment"`` vs
+#: ``environmental``), so always go through this map rather than ``s.value``.
+_SECTOR_FIELD: Dict[Sector, str] = {
+    Sector.MUNICIPAL: "municipal",
+    Sector.INDUSTRIAL: "industrial",
+    Sector.AGRICULTURAL: "agricultural",
+    Sector.ENERGY: "energy",
+    Sector.ENVIRONMENT: "environmental",
+}
+
 
 @dataclass
 class WaterDemand:
@@ -110,14 +124,93 @@ class WaterDemand:
             for s, v in self.withdrawals().items()
         )
 
-    def scaled(self, factor: float, sectors: Optional[List[Sector]] = None) -> "WaterDemand":
-        """Return a copy with the given sectors (default: all withdrawals)
-        multiplied by ``factor``."""
-        sectors = sectors or list(SECTOR_PRIORITY)
-        kwargs = {}
-        for s in sectors:
-            kwargs[s.value] = getattr(self, s.value) * factor
-        return replace(self, **kwargs)
+    def copy(self) -> "WaterDemand":
+        """Return an independent copy of this demand.
+
+        The per-sector ``consumption_fraction`` and ``value_usd_per_m3``
+        dictionaries are re-created, so editing them on the copy never
+        touches the original (``dataclasses.replace`` alone would share
+        them).
+
+        Returns
+        -------
+        WaterDemand
+            A new object comparing equal to ``self`` (volumes in Mm3/yr).
+        """
+        return replace(
+            self,
+            consumption_fraction=dict(self.consumption_fraction),
+            value_usd_per_m3=dict(self.value_usd_per_m3),
+        )
+
+    def scaled(
+        self,
+        factor: float,
+        sectors: Optional[Iterable[Union[Sector, str]]] = None,
+    ) -> "WaterDemand":
+        """Return a copy with the given sectors multiplied by ``factor``.
+
+        Used for demand-growth what-ifs (e.g. municipal and industrial
+        demand growing with population and GDP, Wada et al. 2016).
+
+        Parameters
+        ----------
+        factor : float
+            Dimensionless multiplier applied to each selected sector's
+            annual volume (Mm3/yr); must be finite and ``>= 0``.
+        sectors : iterable of Sector or str, optional
+            Sectors to scale, as :class:`Sector` members or their string
+            values.  ``None`` (default) scales every withdrawal sector in
+            :data:`SECTOR_PRIORITY` and leaves the in-stream
+            ``environmental`` requirement untouched.  ``Sector.ENVIRONMENT``
+            may be passed explicitly to scale the environmental flow (its
+            enum value ``"environment"`` maps onto the ``environmental``
+            field).  An empty iterable scales nothing.
+
+        Returns
+        -------
+        WaterDemand
+            A new object with fresh sector dictionaries (see :meth:`copy`);
+            ``self`` is not modified.
+
+        Raises
+        ------
+        ValueError
+            If ``factor`` is not a finite non-negative number or a sector
+            is not a known :class:`Sector`.
+
+        References
+        ----------
+        Wada, Y. et al. (2016). Modeling global water use for the 21st
+        century: the Water Futures and Solutions (WFaS) initiative and its
+        approaches. *Geoscientific Model Development*, 9, 175-222.
+        """
+        if (
+            isinstance(factor, bool)
+            or not isinstance(factor, numbers.Real)
+            or not math.isfinite(factor)
+            or factor < 0
+        ):
+            raise ValueError(
+                f"factor must be a finite number >= 0, got {factor!r}"
+            )
+        if sectors is None:
+            chosen: List[Sector] = list(SECTOR_PRIORITY)
+        else:
+            chosen = []
+            for s in sectors:
+                try:
+                    chosen.append(s if isinstance(s, Sector) else Sector(s))
+                except ValueError:
+                    raise ValueError(
+                        f"unknown sector {s!r}; expected one of "
+                        f"{[m.value for m in Sector]}"
+                    ) from None
+        kwargs: Dict[str, float] = {}
+        for s in chosen:
+            name = _SECTOR_FIELD[s]
+            kwargs[name] = getattr(self, name) * factor
+        return replace(self.copy(), **kwargs)
 
 
 @dataclass
@@ -207,6 +300,45 @@ class Riparian:
         return self.population * self.food_demand_kcal_per_capita_day * 365.0
 
     def copy(self, **changes) -> "Riparian":
+        """Return an independent copy, optionally with some fields changed.
+
+        Unlike a bare ``dataclasses.replace``, the nested containers are
+        re-created: ``demand`` via :meth:`WaterDemand.copy` (fresh sector
+        dictionaries), ``crops`` as a new list of new :class:`Crop`
+        objects and ``energy`` as a new :class:`EnergySystem`.  Editing
+        any of them on the copy therefore never alters the original, as
+        the no-mutation contract in ``docs/ARCHITECTURE.md`` requires.
+
+        Parameters
+        ----------
+        **changes
+            Field values overriding the copied ones (e.g.
+            ``material_power=1.0`` or ``crops=[...]``).  A nested field
+            given here is used as passed, not copied.
+
+        Returns
+        -------
+        Riparian
+            A new object; with no ``changes`` it compares equal to ``self``.
+
+        Raises
+        ------
+        ValueError
+            If ``changes`` names a field :class:`Riparian` does not have.
+        """
+        known = {f.name for f in fields(self)}
+        unknown = sorted(set(changes) - known)
+        if unknown:
+            raise ValueError(
+                f"unknown Riparian field(s) {unknown}; expected a subset of "
+                f"{sorted(known)}"
+            )
+        if "demand" not in changes:
+            changes["demand"] = self.demand.copy()
+        if "crops" not in changes:
+            changes["crops"] = [replace(c) for c in self.crops]
+        if "energy" not in changes:
+            changes["energy"] = replace(self.energy)
         return replace(self, **changes)
 
 
@@ -269,9 +401,24 @@ class Basin:
         return sum(r.population for r in self.riparians)
 
     def copy(self) -> "Basin":
+        """Return an independent deep copy of the basin.
+
+        Every riparian is copied with :meth:`Riparian.copy`, so demands
+        (including their ``consumption_fraction`` and ``value_usd_per_m3``
+        dictionaries), crops and energy systems of the copy are separate
+        objects.  This is the copy that modules use to obtain a modifiable
+        basin without mutating the caller's object; scenario runs rely on
+        it for isolation.
+
+        Returns
+        -------
+        Basin
+            A new basin comparing equal to ``self`` with riparian
+            positions re-assigned upstream to downstream.
+        """
         return Basin(
             name=self.name,
-            riparians=[replace(r, demand=replace(r.demand), crops=[replace(c) for c in r.crops], energy=replace(r.energy)) for r in self.riparians],
+            riparians=[r.copy() for r in self.riparians],
             headwater_inflow_mm3=self.headwater_inflow_mm3,
             climate_cv=self.climate_cv,
         )

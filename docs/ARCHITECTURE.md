@@ -516,3 +516,26 @@ def format_table(rows, columns=None) -> str   # plain text table
 * Every public function has a docstring with units and at least one test.
 * No module may import `nexus` at import time except `scenarios`, `cli`, `viz`, `optimize`;
   `sustainability.assess` imports `NexusResult` lazily inside the function.
+
+---
+
+## Implementation notes (deviations recorded during final validation)
+
+Every signature above is implemented as written.  Two formulas were refined
+during review; the code, its tests (`tests/test_diplomacy.py`,
+`tests/test_nexus.py`, `tests/test_cli.py`) and the user documentation
+(`README.md`, `docs/METHODOLOGY.md`) follow the refined versions:
+
+* **`diplomacy.negotiate` / `compare_allocation_rules` (section 5)** – the
+  estate is `max(natural_flow * flow_factor - env_terminal, 0)`
+  (`diplomacy.bankruptcy_estate`): only the in-stream requirement at the
+  terminal outlet is withheld, not the sum of every reach's requirement,
+  because water left at an upstream outlet is not a withdrawal and remains
+  available to the riparians below (example basin at mean flow: 26 500
+  instead of 21 000 Mm3/yr).
+* **`NexusModel.entitlements` (section 7)** – bankruptcy rules work on a
+  consumptive basis: `estate = max(natural_flow + sum(start-of-year storages)
+  - sum(environmental flows), 0)`, the claims are the consumptive parts of the
+  riparians' river-water demands, and each award is converted into a gross
+  surface-withdrawal cap, so a rule only rations under physical scarcity and a
+  zero-flow year can still draw down full reservoirs.
